@@ -1,0 +1,424 @@
+from __future__ import annotations
+
+import json
+import math
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+from .config import (
+    DETECTION_CONFIDENCE,
+    EVIDENCE_DIR,
+    LONG_VIDEO_STRIDE,
+    MEDIUM_VIDEO_STRIDE,
+    SHORT_VIDEO_STRIDE,
+    GOOGLE_MAPS_API_KEY,
+)
+from .geo import extract_embedded_gps, normalize_gps_points, nearest_gps, reverse_geocode, snap_route
+from .health import calculate_health
+from .model_service import detector
+from .roughness import camera_motion_value, roughness_from_motion, roughness_from_video_motion
+
+CANONICAL_CLASSES = {
+    'longitudinal_crack': 'longitudinal_crack',
+    'transverse_crack': 'transverse_crack',
+    'fatigue_crack': 'fatigue_crack',
+    'alligator_crack': 'fatigue_crack',
+    'pothole': 'pothole',
+}
+
+
+def _read_json(path: Path | None):
+    if not path or not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _canonical_model_names(model):
+    result = {}
+    for k, v in model.names.items():
+        clean = str(v).strip().lower().replace(' ', '_')
+        if clean in CANONICAL_CLASSES:
+            result[int(k)] = CANONICAL_CLASSES[clean]
+
+    if len(result) != 4:
+        # RDD2022 fallback only when the model itself has exactly four output classes.
+        if len(model.names) == 4:
+            result = {
+                0: 'longitudinal_crack',
+                1: 'transverse_crack',
+                2: 'fatigue_crack',
+                3: 'pothole',
+            }
+        else:
+            raise RuntimeError(f'Unexpected model classes: {model.names}')
+    return result
+
+
+def _center(box):
+    x1, y1, x2, y2 = box
+    return ((x1 + x2) / 2, (y1 + y2) / 2)
+
+
+def _iou(a, b):
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _match_tracks(detections, tracks, frame_idx, frame_diag, max_age_frames):
+    used = set()
+    for det in detections:
+        cx, cy = _center(det['box'])
+        best_id = None
+        best_score = -1e9
+
+        for tid, tr in tracks.items():
+            if tid in used:
+                continue
+            if tr['class_name'] != det['class_name']:
+                continue
+            if frame_idx - tr['last_frame'] > max_age_frames:
+                continue
+
+            ox, oy = _center(tr['box'])
+            dist = math.hypot(cx - ox, cy - oy) / max(frame_diag, 1.0)
+            overlap = _iou(det['box'], tr['box'])
+
+            # Match the same visible defect across nearby frames.
+            if overlap >= 0.08 or dist <= 0.14:
+                score = overlap - dist
+                if score > best_score:
+                    best_score = score
+                    best_id = tid
+
+        if best_id is None:
+            best_id = str(uuid.uuid4())
+            tracks[best_id] = {
+                'class_name': det['class_name'],
+                'box': det['box'],
+                'last_frame': frame_idx,
+                'best': det,
+            }
+        else:
+            tracks[best_id]['box'] = det['box']
+            tracks[best_id]['last_frame'] = frame_idx
+            if det['confidence'] > tracks[best_id]['best']['confidence']:
+                tracks[best_id]['best'] = det
+
+        used.add(best_id)
+
+
+def _automatic_frame_stride(duration_sec: float | None) -> int:
+    """Automatically balances detector sensitivity and processing time."""
+    if duration_sec is None or duration_sec <= 90:
+        return max(1, SHORT_VIDEO_STRIDE)
+    if duration_sec <= 300:
+        return max(1, MEDIUM_VIDEO_STRIDE)
+    return max(1, LONG_VIDEO_STRIDE)
+
+
+def _gps_accuracy(points: list[dict]) -> float | None:
+    values = []
+    for p in points:
+        try:
+            value = float(p.get('accuracy'))
+            if math.isfinite(value) and value >= 0:
+                values.append(value)
+        except Exception:
+            pass
+    if not values:
+        return None
+    return float(np.median(values))
+
+
+def _draw_evidence(det: dict) -> np.ndarray:
+    frame = det['frame'].copy()
+    x1, y1, x2, y2 = [int(round(v)) for v in det['box']]
+    color = (70, 90, 255) if det['class_name'] == 'pothole' else (30, 180, 255)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+    label = f"{det['class_name'].replace('_', ' ')} {det['confidence']:.2f}"
+    cv2.putText(
+        frame,
+        label,
+        (max(0, x1), max(24, y1 - 8)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
+    return frame
+
+
+def analyze_video(
+    video_path: Path,
+    gps_json: Path | None,
+    motion_json: Path | None,
+    job_id: str,
+    original_filename: str,
+    progress_cb=None,
+):
+    model = detector.load()
+    if model is None:
+        raise RuntimeError(detector.error or 'RoadPulse model could not be loaded.')
+
+    class_names = _canonical_model_names(model)
+    gps_points = normalize_gps_points(_read_json(gps_json))
+    motion_samples = _read_json(motion_json)
+    warnings = []
+
+    embedded_lat, embedded_lon, embedded_source, gps_diagnostic = extract_embedded_gps(video_path)
+    if gps_points:
+        location_source = 'phone_gps_track'
+    elif embedded_lat is not None and embedded_lon is not None:
+        gps_points = [{
+            't_ms': 0.0,
+            'latitude': embedded_lat,
+            'longitude': embedded_lon,
+            'accuracy': None,
+            'speed': None,
+            'heading': None,
+        }]
+        location_source = embedded_source or 'video_metadata'
+    else:
+        location_source = 'none'
+        if not gps_diagnostic.get('exiftool_available') and not gps_diagnostic.get('ffprobe_available'):
+            warnings.append(
+                'No GPS track was supplied and no embedded GPS was found. ExifTool and FFprobe are not on PATH, '
+                'but RoadPulse also ran its built-in QuickTime ISO6709 scan. This file appears to contain no usable GPS metadata.'
+            )
+        else:
+            warnings.append(
+                'No embedded video GPS or synchronized phone GPS was found. This usually means the video file does not contain '
+                'location metadata (for example after export, messaging, or social-media compression). RoadPulse will not guess the location.'
+            )
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError('The uploaded video could not be decoded by OpenCV/FFmpeg.')
+
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if fps <= 0:
+        fps = 30.0
+        warnings.append('Video FPS metadata was unavailable; 30 FPS was used as a timing fallback.')
+
+    duration = total_frames / fps if total_frames and fps else None
+    confidence = float(np.clip(DETECTION_CONFIDENCE, 0.001, 0.95))
+    frame_stride = _automatic_frame_stride(duration)
+
+    evidence_dir = EVIDENCE_DIR / job_id
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+
+    tracks = {}
+    motion_values = []
+    prev_motion_gray = None
+    analyzed = 0
+    frame_idx = 0
+
+    # Keep tracking IDs alive for about one second of raw video time.
+    max_age_frames = max(8, int(round(fps * 1.0)))
+    # Video-motion fallback is sampled independently of YOLO's adaptive stride.
+    motion_stride = 1 if duration is None or duration <= 120 else 2
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        # Roughness proxy from camera motion, independent of detector stride.
+        if frame_idx % motion_stride == 0:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if prev_motion_gray is not None:
+                val = camera_motion_value(prev_motion_gray, gray)
+                if val is not None:
+                    # Normalize across motion sampling intervals so long videos do not
+                    # appear rougher merely because every second frame was sampled.
+                    motion_values.append(val / motion_stride)
+            prev_motion_gray = gray
+
+        if frame_idx % frame_stride != 0:
+            frame_idx += 1
+            continue
+
+        analyzed += 1
+        t_sec = frame_idx / fps
+        result = model.predict(frame, conf=confidence, imgsz=640, verbose=False)[0]
+        detections = []
+
+        if result.boxes is not None and len(result.boxes) > 0:
+            cls_ids = result.boxes.cls.int().cpu().tolist()
+            confs = result.boxes.conf.cpu().tolist()
+            boxes = result.boxes.xyxy.cpu().tolist()
+            h, w = frame.shape[:2]
+            diag = math.hypot(w, h)
+
+            for cls_id, conf, box in zip(cls_ids, confs, boxes):
+                if cls_id not in class_names:
+                    continue
+                point = nearest_gps(gps_points, t_sec)
+                detections.append({
+                    'class_name': class_names[cls_id],
+                    'confidence': float(conf),
+                    'box': [float(x) for x in box],
+                    't_sec': float(t_sec),
+                    'latitude': point['latitude'] if point else None,
+                    'longitude': point['longitude'] if point else None,
+                    'frame': frame.copy(),
+                })
+
+            _match_tracks(detections, tracks, frame_idx, diag, max_age_frames=max_age_frames)
+
+        frame_idx += 1
+        if progress_cb and total_frames > 0 and analyzed % 3 == 0:
+            progress_cb(
+                min(88.0, 8.0 + (frame_idx / total_frames) * 80.0),
+                'Running YOLO and synchronizing detections…',
+            )
+
+    cap.release()
+
+    defects = []
+    counts = {
+        'longitudinal_crack': 0,
+        'transverse_crack': 0,
+        'fatigue_crack': 0,
+        'pothole': 0,
+    }
+
+    for i, (tid, tr) in enumerate(tracks.items(), start=1):
+        det = tr['best']
+        counts[det['class_name']] += 1
+        evidence_name = f'{i:04d}_{det["class_name"]}.jpg'
+        annotated = _draw_evidence(det)
+        cv2.imwrite(str(evidence_dir / evidence_name), annotated)
+        defects.append({
+            'id': tid,
+            'class_name': det['class_name'],
+            'confidence': det['confidence'],
+            't_sec': det['t_sec'],
+            'latitude': det['latitude'],
+            'longitude': det['longitude'],
+            'road_name': None,
+            'evidence_url': f'/evidence/{job_id}/{evidence_name}',
+        })
+
+    if progress_cb:
+        progress_cb(90, 'Estimating roughness…')
+
+    if motion_samples:
+        r_index, r_label, r_features = roughness_from_motion(motion_samples, gps_points)
+        r_source = 'phone_motion_sensors'
+        if r_index is None:
+            warnings.append(
+                'Phone motion data was present but insufficient for a stable roughness estimate; '
+                'the video-motion proxy was used instead.'
+            )
+            r_index, r_label, r_features = roughness_from_video_motion(motion_values)
+            r_source = 'video_motion_proxy'
+    else:
+        r_index, r_label, r_features = roughness_from_video_motion(motion_values)
+        r_source = 'video_motion_proxy'
+        warnings.append(
+            'Roughness was estimated from camera motion because synchronized phone motion samples '
+            'were not available. This is a RoadPulse prototype roughness index, not IRI.'
+        )
+
+    if r_index is None:
+        r_label = 'Unavailable'
+
+    if progress_cb:
+        progress_cb(94, 'Resolving GPS and road name…')
+
+    route_points, geo_warnings = snap_route(gps_points)
+    warnings.extend(geo_warnings)
+
+    # Use a real point on the snapped route, not the arithmetic mean, for road lookup.
+    lookup_points = route_points or gps_points
+    if lookup_points:
+        middle = lookup_points[len(lookup_points) // 2]
+        center_lat = float(middle['latitude'])
+        center_lon = float(middle['longitude'])
+    else:
+        center_lat = center_lon = None
+
+    road_name = formatted_address = place_id = None
+    if center_lat is not None:
+        road_name, formatted_address, place_id = reverse_geocode(center_lat, center_lon)
+        if not road_name:
+            warnings.append(
+                'GPS coordinates were available, but an exact road name was not returned. '
+                'Verify the Google Maps API key, billing, and Roads/Geocoding API enablement.'
+            )
+
+    # Resolve each defect to the road at its own GPS coordinate when Google is configured.
+    # The OpenStreetMap/Nominatim development fallback is intentionally not called once per defect
+    # because its public service is rate-limited; those defects inherit the survey road name.
+    cache = {}
+    for d in defects:
+        if d['latitude'] is None or d['longitude'] is None:
+            continue
+        if GOOGLE_MAPS_API_KEY:
+            key = (round(d['latitude'], 5), round(d['longitude'], 5))
+            if key not in cache:
+                cache[key] = reverse_geocode(d['latitude'], d['longitude'])[0]
+            d['road_name'] = cache[key] or road_name
+        else:
+            d['road_name'] = road_name
+
+    score, status = calculate_health(counts, r_label)
+    accuracy_m = _gps_accuracy(gps_points)
+
+    if progress_cb:
+        progress_cb(100, 'Analysis complete')
+
+    return {
+        'summary': {
+            'health_score': score,
+            'status': status,
+            'total_defects': sum(counts.values()),
+            'counts': counts,
+            'roughness_index': r_index,
+            'roughness_label': r_label,
+            'roughness_source': r_source,
+            'roughness_features': r_features,
+        },
+        'location': {
+            'source': location_source,
+            'accuracy_m': accuracy_m,
+            'center_lat': center_lat,
+            'center_lon': center_lon,
+            'road_name': road_name,
+            'formatted_address': formatted_address,
+            'place_id': place_id,
+            'route_points': route_points,
+            'gps_diagnostic': gps_diagnostic,
+        },
+        'video': {
+            'filename': original_filename,
+            'fps': fps,
+            'duration_sec': duration,
+            'frames_analyzed': analyzed,
+            'total_frames': total_frames,
+            'analysis_frame_stride': frame_stride,
+            'detection_confidence': confidence,
+            'processed_at': datetime.now(timezone.utc).isoformat(),
+        },
+        'defects': defects,
+        'warnings': list(dict.fromkeys(warnings)),
+    }
