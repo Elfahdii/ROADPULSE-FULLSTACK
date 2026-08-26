@@ -1,0 +1,25 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      ROADPULSE_MODEL_PATH: /app/models/best.pt
+      ROADPULSE_DATA_DIR: /app/data
+      GOOGLE_MAPS_API_KEY: ${GOOGLE_MAPS_API_KEY:-}
+      FRONTEND_ORIGIN: http://localhost:3000
+    volumes:
+      - ./models:/app/models:ro
+      - ./data:/app/data
+    ports:
+      - "8000:8000"
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        VITE_API_URL: http://localhost:8000
+    depends_on:
+      - backend
+    ports:
+      - "3000:80"

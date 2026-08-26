@@ -1,0 +1,14 @@
+node_modules/
+dist/
+__pycache__/
+.pytest_cache/
+.venv/
+.env
+.DS_Store
+data/uploads/*
+data/evidence/*
+!data/uploads/.gitkeep
+!data/evidence/.gitkeep
+
+data/roadpulse.db
+.idea/
