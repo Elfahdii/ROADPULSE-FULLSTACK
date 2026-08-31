@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { Fragment, useEffect, useRef, useState } from 'react'
 import { MapContainer, TileLayer, Polyline, CircleMarker, Popup, useMap } from 'react-leaflet'
 import { BarChart, Bar, Cell, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts'
 import {
@@ -160,11 +160,79 @@ function RoadMap({ result }) {
     </div>
   )
 }
+function PersistentRoadMap({ surveys }) {
+  const roadLayers = (surveys || [])
+    .filter(item => item?.result?.location)
+    .map(item => ({
+      surveyId: item.survey_id,
+      route: item.result.location?.route_points || [],
+      center: item.result.location?.center_lat != null && item.result.location?.center_lon != null
+        ? { latitude: item.result.location.center_lat, longitude: item.result.location.center_lon }
+        : null,
+      result: item.result,
+    }))
+    .filter(item => item.route.length > 0 || item.center)
+
+  const allPoints = roadLayers.flatMap(item => item.route.length ? item.route : [item.center])
+  const defaultCenter = [26.0667, 50.5577]
+  const center = allPoints.length
+    ? [allPoints[0].latitude, allPoints[0].longitude]
+    : defaultCenter
+
+  return (
+    <div className="map-card">
+      <MapContainer center={center} zoom={allPoints.length ? 13 : 10} scrollWheelZoom className="map-view">
+        <FitMap points={allPoints} center={center} />
+        <TileLayer attribution="&copy; OpenStreetMap contributors" url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+
+        {roadLayers.map(({ surveyId, route, center: roadCenter, result }) => {
+          const color = STATUS_COLORS[result.summary?.status] || '#4cc9f0'
+          const markerPoint = roadCenter || route[0]
+          const popup = (
+            <Popup>
+              <strong>{result.location?.road_name || 'Road analysis'}</strong><br />
+              Health: {result.summary?.health_score ?? '—'}<br />
+              Status: {result.summary?.status || 'Unknown'}
+            </Popup>
+          )
+
+          return (
+            <Fragment key={surveyId}>
+              {route.length > 1 ? (
+                <Polyline positions={route.map(p => [p.latitude, p.longitude])} pathOptions={{ color, weight: 7, opacity: 0.9 }}>
+                  {popup}
+                </Polyline>
+              ) : markerPoint ? (
+                <CircleMarker center={[markerPoint.latitude, markerPoint.longitude]} radius={9} pathOptions={{ color, fillColor: color, fillOpacity: 0.9 }}>
+                  {popup}
+                </CircleMarker>
+              ) : null}
+
+              {(result.defects || []).filter(d => d.latitude != null && d.longitude != null).map(defect => (
+                <CircleMarker
+                  key={`${surveyId}-${defect.id}`}
+                  center={[defect.latitude, defect.longitude]}
+                  radius={5}
+                  pathOptions={{ color: CLASS_COLORS[defect.class_name] || '#ff5d73', fillColor: CLASS_COLORS[defect.class_name] || '#ff5d73', fillOpacity: 0.95 }}
+                >
+                  <Popup>
+                    <strong>{CLASS_LABELS[defect.class_name] || defect.class_name}</strong><br />
+                    {result.location?.road_name || 'Road location'} · {formatTime(defect.t_sec)}
+                  </Popup>
+                </CircleMarker>
+              ))}
+            </Fragment>
+          )
+        })}
+      </MapContainer>
+    </div>
+  )
+}
 
 function downloadReport(result) {
   if (!result) return
   const rows = [
-    ['RoadPulse Report'],
+    ['RoadPulse Road Analysis Report'],
     ['Road', result.location?.road_name || 'Unavailable'],
     ['Address', result.location?.formatted_address || 'Unavailable'],
     ['Latitude', result.location?.center_lat ?? ''],
@@ -178,6 +246,8 @@ function downloadReport(result) {
     ['Unique Defects', result.summary?.total_defects ?? 0],
     ['Video File', result.video?.filename || ''],
     ['Duration (sec)', result.video?.duration_sec ?? ''],
+    ['Analysis Sampling (fps)', result.video?.analysis_sampling_fps ?? ''],
+    ['Frame Stride', result.video?.analysis_frame_stride ?? ''],
     [],
     ['Type', 'Confidence', 'Video Time (sec)', 'Road', 'Latitude', 'Longitude'],
     ...(result.defects || []).map(d => [
@@ -194,7 +264,7 @@ function downloadReport(result) {
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
-  a.download = 'roadpulse-report.csv'
+  a.download = 'roadpulse-analysis-report.csv'
   a.click()
   URL.revokeObjectURL(url)
 }
@@ -283,16 +353,16 @@ function RecordSurvey({ onStarted }) {
     setPermissionMessage('')
     try {
       if (!window.isSecureContext && location.hostname !== 'localhost') throw new Error('Phone recording requires HTTPS.')
-      if (!('geolocation' in navigator)) throw new Error('This browser does not provide geolocation. RoadPulse phone surveys require GPS.')
+      if (!('geolocation' in navigator)) throw new Error('This browser does not provide geolocation. RoadPulse phone video analysis requires GPS.')
 
       await requestMotionPermission()
 
       // Get one GPS fix before recording starts. This avoids saving a phone
-      // survey with an empty GPS track while the permission dialog is pending.
+      // road video with an empty GPS track while the permission dialog is pending.
       const initialPosition = await new Promise((resolve, reject) => {
         navigator.geolocation.getCurrentPosition(
           resolve,
-          err => reject(new Error(`GPS is required for a phone survey: ${err.message}`)),
+          err => reject(new Error(`GPS is required for a phone road video: ${err.message}`)),
           { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 },
         )
       })
@@ -367,13 +437,13 @@ function RecordSurvey({ onStarted }) {
       const type = recorder.mimeType || 'video/webm'
       const ext = type.includes('mp4') ? 'mp4' : 'webm'
       const blob = new Blob(chunksRef.current, { type })
-      const videoFile = new File([blob], `roadpulse-phone-survey.${ext}`, { type })
+      const videoFile = new File([blob], `roadpulse-phone-video.${ext}`, { type })
       const gpsFile = new File([JSON.stringify(gpsRef.current)], 'gps.json', { type: 'application/json' })
       const motionFile = new File([JSON.stringify(motionRef.current)], 'motion.json', { type: 'application/json' })
       const job = await createAnalysisJob({ videoFile, gpsFile, motionFile })
       onStarted(job.job_id)
     } catch (e) {
-      setError(e?.response?.data?.detail || e.message || 'Could not upload recorded survey.')
+      setError(e?.response?.data?.detail || e.message || 'Could not upload the recorded road video.')
     }
   }
 
@@ -397,7 +467,7 @@ function RecordSurvey({ onStarted }) {
       {error && <div className="error-box">{error}</div>}
       <div className="record-actions">
         {!recording
-          ? <button className="primary-button" onClick={start}><Camera size={18} /> Start road survey</button>
+          ? <button className="primary-button" onClick={start}><Camera size={18} /> Start road video</button>
           : <button className="danger-button" onClick={stop}><span className="stop-square" /> Stop & analyze</button>}
       </div>
       <div className="auto-analysis-strip phone-strip">
@@ -414,14 +484,14 @@ function EmptyDashboard({ onUpload, onRecord }) {
   return (
     <div className="dashboard-grid empty-dashboard">
       <div className="metrics-grid">
-        <MetricCard icon={Gauge} label="Road Health Score" value="— / 100" helper="Run a survey to calculate" tone="green" />
-        <MetricCard icon={AlertTriangle} label="Unique Defects" value="—" helper="No survey analyzed yet" tone="yellow" />
+        <MetricCard icon={Gauge} label="Road Health Score" value="— / 100" helper="Analyze a road video to calculate" tone="green" />
+        <MetricCard icon={AlertTriangle} label="Unique Defects" value="—" helper="No road video analyzed yet" tone="yellow" />
         <MetricCard icon={Activity} label="Roughness Index" value="— / 100" helper="Measured automatically" tone="red" />
         <MetricCard icon={MapPin} label="Road" value="Not identified" helper="Resolved from GPS" tone="blue" />
       </div>
       <section className="panel start-card">
         <div className="start-icon"><Route size={34} /></div>
-        <h2>Start a RoadPulse survey</h2>
+        <h2>Start a RoadPulse video analysis</h2>
         <p>Upload a road video or record directly from your phone. RoadPulse will detect damage, locate the road and estimate roughness automatically.</p>
         <div className="start-actions">
           <button className="primary-button compact" onClick={onUpload}><Upload size={18} /> Upload video</button>
@@ -441,7 +511,7 @@ function AnalysisProgress({ job, jobId, onReset }) {
           <div className="panel-title">Road analysis in progress</div>
           <div className="job-id">{jobId}</div>
         </div>
-        <button className="ghost-button" onClick={onReset}><RotateCcw size={16} /> Cancel / new survey</button>
+        <button className="ghost-button" onClick={onReset}><RotateCcw size={16} /> Cancel / new video</button>
       </section>
       <section className="panel progress-panel">
         <div className="progress-head"><span>{job?.message || 'Preparing analysis…'}</span><strong>{Math.round(progress)}%</strong></div>
@@ -465,6 +535,15 @@ function AnalysisResults({ result }) {
   const evidence = sortedDefects.filter(d => d.evidence_url)
   const preview = evidence[0]
   const location = result.location || {}
+  const annotatedVideoUrl =
+      result.video?.annotated_video_url
+  const analysisSamplingFps = result.video?.analysis_sampling_fps
+    ?? (result.video?.fps && result.video?.analysis_frame_stride
+      ? result.video.fps / result.video.analysis_frame_stride
+      : null)
+  const samplingLabel = analysisSamplingFps == null
+    ? 'YOLO bounding boxes'
+    : `${Number(analysisSamplingFps).toFixed(analysisSamplingFps < 10 ? 1 : 0)} analyzed frame${Math.abs(analysisSamplingFps - 1) < 0.01 ? '' : 's'}/second · YOLO bounding boxes`
 
   return (
     <div className="results-stack">
@@ -484,13 +563,13 @@ function AnalysisResults({ result }) {
 
       <div className="overview-grid">
         <section className="panel map-panel" id="map-section">
-          <div className="panel-title">Survey Location</div>
+          <div className="panel-title">Road Location</div>
           <RoadMap result={result} />
         </section>
 
         <section className="panel recent-panel">
           <div className="panel-heading-row">
-            <div className="panel-title">Recent Survey</div>
+            <div className="panel-title">Selected Road Analysis</div>
             <StatusPill value="Completed" />
           </div>
           <div className="recent-content">
@@ -504,7 +583,7 @@ function AnalysisResults({ result }) {
               <div className="detail-line"><MapPin size={16} /><span>{location.formatted_address || 'No road address available'}</span></div>
               <div className="detail-line"><Clock size={16} /><span>{formatDuration(result.video?.duration_sec)}</span></div>
               <div className="detail-line"><Route size={16} /><span>{location.center_lat != null ? `${location.center_lat.toFixed(6)}, ${location.center_lon.toFixed(6)}` : 'Coordinates unavailable'}</span></div>
-              <div className="detail-line"><FileVideo size={16} /><span>{result.video?.filename || 'Uploaded survey video'}</span></div>
+              <div className="detail-line"><FileVideo size={16} /><span>{result.video?.filename || 'Uploaded road video'}</span></div>
             </div>
           </div>
           <div className="recent-stats">
@@ -519,6 +598,31 @@ function AnalysisResults({ result }) {
           </div>
         </section>
       </div>
+      {annotatedVideoUrl && (
+          <section className="panel analyzed-video-panel">
+
+            <div className="panel-heading-row">
+              <div className="panel-title">
+                Analyzed Video
+              </div>
+
+              <span className="muted small">
+        {samplingLabel}
+      </span>
+            </div>
+
+            <video
+                className="analyzed-video-player"
+                controls
+                playsInline
+                preload="metadata"
+                src={`${API_URL}${annotatedVideoUrl}`}
+            >
+              Your browser does not support video playback.
+            </video>
+
+          </section>
+      )}
 
       <div className="analytics-grid">
         <section className="panel chart-panel">
@@ -588,7 +692,7 @@ function AnalysisResults({ result }) {
       <section className="metadata-strip" id="report-section">
         <div><MapPin size={18} /><span><small>GPS Source</small><strong className={location.source === 'none' ? 'danger-text' : 'success-text'}>{sourceLabel(location.source)}</strong><em>{location.accuracy_m != null ? `Accuracy: ±${Math.round(location.accuracy_m)} m` : 'Accuracy not reported'}</em></span></div>
         <div><Route size={18} /><span><small>Coordinates</small><strong>{location.center_lat != null ? `${location.center_lat.toFixed(6)}, ${location.center_lon.toFixed(6)}` : 'Unavailable'}</strong></span></div>
-        <div><Clock size={18} /><span><small>Survey Duration</small><strong>{formatDuration(result.video?.duration_sec)}</strong></span></div>
+        <div><Clock size={18} /><span><small>Video Duration</small><strong>{formatDuration(result.video?.duration_sec)}</strong></span></div>
         <div><FileVideo size={18} /><span><small>Video File</small><strong>{result.video?.filename || 'Unknown'}</strong></span></div>
         <div><CheckCircle2 size={18} /><span><small>Processed At</small><strong>{result.video?.processed_at ? new Date(result.video.processed_at).toLocaleString() : 'Just now'}</strong></span></div>
       </section>
@@ -603,27 +707,106 @@ function formatSurveyDate(value) {
   return Number.isNaN(d.getTime()) ? value : d.toLocaleString()
 }
 
-function SurveyHistoryPage({ surveys, onOpenSurvey, onNewSurvey }) {
+function conditionFromScore(score) {
+  if (score == null) return 'Unknown'
+  if (score >= 80) return 'Good'
+  if (score >= 60) return 'Fair'
+  if (score >= 40) return 'Poor'
+  return 'Critical'
+}
+
+function RoadRankings({ surveys, onOpenAnalysis }) {
+  const grouped = new Map()
+
+  ;(surveys || []).forEach((analysis) => {
+    const road = analysis.road_name || analysis.formatted_address || analysis.filename || 'Unidentified road'
+    const key = `${analysis.road_name || ''}|${analysis.formatted_address || road}`.toLowerCase()
+    const current = grouped.get(key) || {
+      road,
+      address: analysis.formatted_address || analysis.filename || 'Location unavailable',
+      latestId: analysis.survey_id,
+      analysisCount: 0,
+      healthTotal: 0,
+      healthCount: 0,
+      totalDefects: 0,
+    }
+    const health = analysis.health_score == null ? null : Number(analysis.health_score)
+    current.analysisCount += 1
+    current.totalDefects += Number(analysis.total_defects || 0)
+    if (Number.isFinite(health)) {
+      current.healthTotal += health
+      current.healthCount += 1
+    }
+    grouped.set(key, current)
+  })
+
+  const rankings = [...grouped.values()]
+    .map(item => ({
+      ...item,
+      averageHealth: item.healthCount ? Math.round(item.healthTotal / item.healthCount) : null,
+    }))
+    .sort((a, b) => {
+      if (a.averageHealth == null) return 1
+      if (b.averageHealth == null) return -1
+      return b.averageHealth - a.averageHealth || a.totalDefects - b.totalDefects
+    })
+
+  return (
+    <section className="panel road-rankings-panel">
+      <div className="panel-heading-row rankings-heading">
+        <div>
+          <div className="panel-title"><BarChart3 size={18} /> Road Rankings</div>
+          <p className="muted">Roads are ranked by average health score, from best condition to most urgent attention.</p>
+        </div>
+        <span className="muted small">{rankings.length} roads</span>
+      </div>
+
+      {rankings.length === 0 ? (
+        <div className="ranking-empty">Analyze a road video to create the first ranking.</div>
+      ) : (
+        <div className="ranking-list">
+          <div className="ranking-header"><span>Rank</span><span>Road</span><span>Analyses</span><span>Health</span><span>Defects</span><span>Condition</span></div>
+          {rankings.map((road, index) => {
+            const condition = conditionFromScore(road.averageHealth)
+            const rankingNote = rankings.length === 1 ? 'Only ranked road' : index === 0 ? 'Best condition' : index === rankings.length - 1 ? 'Needs attention' : ''
+            return (
+              <button className="ranking-row" key={`${road.road}-${road.latestId}`} onClick={() => onOpenAnalysis(road.latestId)}>
+                <span className={`rank-number rank-${index + 1}`}>#{index + 1}</span>
+                <span className="ranking-road"><strong>{road.road}</strong><small>{rankingNote || road.address}</small></span>
+                <strong>{road.analysisCount}</strong>
+                <strong>{road.averageHealth == null ? '—' : `${road.averageHealth} / 100`}</strong>
+                <strong>{road.totalDefects}</strong>
+                <StatusPill value={condition} />
+              </button>
+            )
+          })}
+        </div>
+      )}
+    </section>
+  )
+}
+
+function AnalysisHistoryPage({ surveys, selectedAnalysisId, onOpenAnalysis, onNewAnalysis }) {
   return (
     <section className="panel history-page">
       <div className="panel-heading-row history-heading">
         <div>
-          <div className="panel-title"><History size={18} /> Survey History</div>
-          <p className="muted">Completed surveys are saved by the RoadPulse backend and remain available after you start a new survey or restart the dashboard.</p>
+          <div className="panel-title"><History size={18} /> Analysis History</div>
+          <p className="muted">Completed road-video analyses stay available after you start a new analysis or restart the dashboard.</p>
         </div>
-        <button className="primary-button compact" onClick={onNewSurvey}><Upload size={17} /> New survey</button>
+        <button className="primary-button compact" onClick={onNewAnalysis}><Upload size={17} /> Analyze new video</button>
       </div>
 
       {surveys.length === 0 ? (
         <div className="history-empty">
           <History size={36} />
-          <strong>No saved surveys yet</strong>
+          <strong>No saved analyses yet</strong>
           <span>Your first completed analysis will appear here automatically.</span>
         </div>
       ) : (
         <div className="history-list">
           {surveys.map((survey) => (
-            <button className="history-row" key={survey.survey_id} onClick={() => onOpenSurvey(survey.survey_id)}>
+            <button className={`history-row ${selectedAnalysisId === survey.survey_id ? 'selected' : ''}`} key={survey.survey_id} onClick={() => onOpenAnalysis(survey.survey_id)}>
               <div className="history-road">
                 <div className="history-icon"><Route size={17} /></div>
                 <span>
@@ -635,12 +818,50 @@ function SurveyHistoryPage({ surveys, onOpenSurvey, onNewSurvey }) {
               <div><small>Health</small><strong>{survey.health_score ?? '—'} / 100</strong></div>
               <div><small>Defects</small><strong>{survey.total_defects ?? 0}</strong></div>
               <div><small>Roughness</small><strong>{survey.roughness_label || 'Unavailable'}</strong></div>
-              <span className="history-open">Open</span>
+              <span className="history-open">{selectedAnalysisId === survey.survey_id ? 'Selected' : 'Select'}</span>
             </button>
           ))}
         </div>
       )}
     </section>
+  )
+}
+
+function HistoryReportsPage({ surveys, result, selectedAnalysisId, onOpenAnalysis, onNewAnalysis, onOpenDashboard }) {
+  return (
+    <div className="history-report-stack">
+      <section className="panel report-page combined-report-page">
+        <div className="panel-heading-row">
+          <div>
+            <div className="panel-title"><FileText size={18} /> Selected Analysis Report</div>
+            <p className="muted">Select any saved analysis below, then download its CSV report.</p>
+          </div>
+          {result && <StatusPill value={result.summary?.status} />}
+        </div>
+        {result ? (
+          <>
+            <div className="report-summary">
+              <div><small>Road</small><strong>{result.location?.road_name || 'Unavailable'}</strong></div>
+              <div><small>Health Score</small><strong>{result.summary?.health_score ?? '—'} / 100</strong></div>
+              <div><small>Defects</small><strong>{result.summary?.total_defects ?? 0}</strong></div>
+              <div><small>Roughness</small><strong>{result.summary?.roughness_label || 'Unavailable'}</strong></div>
+            </div>
+            <div className="report-actions">
+              <button className="primary-button compact" onClick={() => downloadReport(result)}><Download size={17} /> Download CSV report</button>
+              <button className="ghost-button compact" onClick={onOpenDashboard}><LayoutDashboard size={17} /> Open on Dashboard</button>
+            </div>
+          </>
+        ) : (
+          <div className="report-empty">Select a saved analysis below to prepare its report.</div>
+        )}
+      </section>
+      <AnalysisHistoryPage
+        surveys={surveys}
+        selectedAnalysisId={selectedAnalysisId}
+        onOpenAnalysis={onOpenAnalysis}
+        onNewAnalysis={onNewAnalysis}
+      />
+    </div>
   )
 }
 
@@ -652,8 +873,8 @@ function DefectsPage({ result }) {
     return (
       <section className="panel defects-page-empty">
         <AlertTriangle size={38} />
-        <h2>No survey selected</h2>
-        <p>Open a saved survey from Survey History or analyze a new road video first.</p>
+        <h2>No analysis selected</h2>
+        <p>Select a saved road analysis from History & Reports or analyze a new road video first.</p>
       </section>
     )
   }
@@ -678,12 +899,12 @@ function DefectsPage({ result }) {
       <section className="panel defects-hero">
         <div>
           <div className="panel-title"><AlertTriangle size={18} /> Defect Intelligence</div>
-          <p className="muted">A dedicated view of every deduplicated defect from the selected survey.</p>
+          <p className="muted">Every deduplicated defect from the selected road video, with filters and evidence.</p>
         </div>
-        <div className="defect-survey-context">
+        <div className="defect-analysis-context">
           <small>Selected road</small>
           <strong>{location.road_name || 'Location unavailable'}</strong>
-          <span>{result.video?.filename || 'Survey video'}</span>
+          <span>{result.video?.filename || 'Road video'}</span>
         </div>
       </section>
 
@@ -752,15 +973,37 @@ function DefectsPage({ result }) {
   )
 }
 
+function UnifiedDashboard({ result, surveys, mapResults, onUpload, onRecord, onOpenAnalysis }) {
+  return (
+    <div className="unified-dashboard">
+      {result
+        ? <AnalysisResults result={result} />
+        : <EmptyDashboard onUpload={onUpload} onRecord={onRecord} />}
+
+      <RoadRankings surveys={surveys} onOpenAnalysis={onOpenAnalysis} />
+
+      <section className="panel network-map-panel">
+        <div className="panel-heading-row">
+          <div>
+            <div className="panel-title"><MapIcon size={18} /> All Roads Map</div>
+            <p className="muted">Saved road routes are colored by condition so the full network can be compared in one view.</p>
+          </div>
+          <span className="muted small">{mapResults.length} saved analyses</span>
+        </div>
+        <PersistentRoadMap surveys={mapResults} />
+      </section>
+
+      <DefectsPage result={result} />
+    </div>
+  )
+}
+
 function Sidebar({ activePage, setActivePage, result, backendHealth }) {
   const items = [
     ['dashboard', LayoutDashboard, 'Dashboard'],
-    ['upload', CloudUpload, 'Upload Survey'],
-    ['record', Smartphone, 'Record with Phone'],
-    ['surveys', History, 'Survey History'],
-    ['map', MapIcon, 'Map View'],
-    ['defects', AlertTriangle, 'Defects'],
-    ['reports', FileText, 'Reports'],
+    ['upload', CloudUpload, 'Analyze Road Video'],
+    ['record', Smartphone, 'Record Road Video'],
+    ['history', FileText, 'History & Reports'],
     ['about', Info, 'About'],
   ]
 
@@ -782,7 +1025,7 @@ function Sidebar({ activePage, setActivePage, result, backendHealth }) {
         <div className="system-title">System Status</div>
         <div className="system-line"><span className={`status-dot ${backendHealth?.ok ? 'online' : 'offline'}`} />{backendHealth?.ok ? 'Backend online' : 'Backend unavailable'}</div>
         <div className="system-meta"><small>AI Model</small><strong className={backendHealth?.model_loaded ? 'success-text' : 'danger-text'}>{backendHealth?.model_loaded ? 'best.pt loaded' : 'Not loaded'}</strong></div>
-        <div className="system-meta"><small>Road</small><strong>{result?.location?.road_name || 'Awaiting survey'}</strong></div>
+        <div className="system-meta"><small>Road</small><strong>{result?.location?.road_name || 'Awaiting analysis'}</strong></div>
       </div>
       <div className="sidebar-footer"><strong>RoadPulse v2</strong><span>Road Condition Intelligence</span></div>
     </aside>
@@ -798,6 +1041,7 @@ function AboutPage() {
         <div><strong>Visible damage</strong><span>Longitudinal cracks, transverse cracks, fatigue cracks and potholes.</span></div>
         <div><strong>Location</strong><span>Embedded video GPS or synchronized phone GPS. Road name is resolved automatically.</span></div>
         <div><strong>Roughness</strong><span>Phone motion sensors when available, otherwise a video-motion proxy. It is not IRI.</span></div>
+        <div><strong>Video sampling</strong><span>YOLO analyzes one frame per video second; at 30 FPS it skips 29 frames between detections.</span></div>
       </div>
     </section>
   )
@@ -810,14 +1054,43 @@ function App() {
   const [pollError, setPollError] = useState('')
   const [backendHealth, setBackendHealth] = useState(null)
   const [surveys, setSurveys] = useState([])
+  const [mapResults, setMapResults] = useState([])
   const [selectedResult, setSelectedResult] = useState(null)
   const [selectedSurveyId, setSelectedSurveyId] = useState(null)
   const [historyError, setHistoryError] = useState('')
+
+
+  async function refreshMapResults(rows = null) {
+    try {
+      const surveyRows = rows || await listSurveys()
+
+      const details = await Promise.all(
+          surveyRows.map(async (survey) => {
+            try {
+              const detail = await getSurvey(survey.survey_id)
+              return {
+                survey_id: survey.survey_id,
+                result: detail.result
+              }
+            } catch {
+              return null
+            }
+          })
+      )
+
+      setMapResults(details.filter(Boolean))
+    } catch (e) {
+      console.error('Could not load saved road analyses for the map:', e)
+    }
+  }
+
+
 
   async function refreshSurveys({ openLatest = false } = {}) {
     try {
       const rows = await listSurveys()
       setSurveys(rows)
+      await refreshMapResults(rows)
       setHistoryError('')
       if (openLatest && rows.length > 0 && !jobId && !selectedResult) {
         const detail = await getSurvey(rows[0].survey_id)
@@ -825,13 +1098,13 @@ function App() {
         setSelectedSurveyId(rows[0].survey_id)
       }
     } catch (e) {
-      setHistoryError(e.message || 'Could not load survey history.')
+      setHistoryError(e.message || 'Could not load analysis history.')
     }
   }
 
   useEffect(() => {
     getHealth().then(setBackendHealth).catch(() => setBackendHealth({ ok: false, model_loaded: false }))
-    // Restore the most recent completed survey after a browser refresh.
+    // Restore the most recent completed analysis after a browser refresh.
     refreshSurveys({ openLatest: true })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -848,7 +1121,7 @@ function App() {
             setSelectedResult(null)
             setSelectedSurveyId(data.job_id)
             setActivePage('dashboard')
-            listSurveys().then(setSurveys).catch(() => {})
+            refreshSurveys().catch(() => {})
           }
           if (!['completed', 'failed'].includes(data.status)) setTimeout(tick, 1000)
         }
@@ -892,7 +1165,7 @@ function App() {
       setPollError('')
       setActivePage(page)
     } catch (e) {
-      setHistoryError(e.message || 'Could not open saved survey.')
+      setHistoryError(e.message || 'Could not open the saved analysis.')
     }
   }
 
@@ -907,7 +1180,7 @@ function App() {
           <XCircle size={36} />
           <h2>Analysis failed</h2>
           <p>{job.error || 'Unknown error'}</p>
-          <button className="primary-button compact" onClick={reset}>Start another survey</button>
+          <button className="primary-button compact" onClick={reset}>Analyze another video</button>
         </section>
       )
     }
@@ -916,56 +1189,40 @@ function App() {
     if (activePage === 'record') return <RecordSurvey onStarted={startJob} />
     if (activePage === 'about') return <AboutPage />
 
-    if (activePage === 'surveys') {
-      return <SurveyHistoryPage surveys={surveys} onOpenSurvey={openSurvey} onNewSurvey={() => newSurvey('upload')} />
+    if (activePage === 'history') {
+      return (
+        <HistoryReportsPage
+          surveys={surveys}
+          result={result}
+          selectedAnalysisId={selectedSurveyId}
+          onOpenAnalysis={(id) => openSurvey(id, 'history')}
+          onNewAnalysis={() => newSurvey('upload')}
+          onOpenDashboard={() => setActivePage('dashboard')}
+        />
+      )
     }
 
-    if (activePage === 'map') {
-      return result
-        ? <section className="panel standalone-map"><div className="panel-title">Map View</div><RoadMap result={result} /></section>
-        : <EmptyDashboard onUpload={() => newSurvey('upload')} onRecord={() => newSurvey('record')} />
-    }
-
-    if (activePage === 'defects') {
-      return <DefectsPage result={result} />
-    }
-
-    if (activePage === 'reports') {
-      return result ? (
-        <section className="panel report-page">
-          <div className="panel-title"><FileText size={18} /> RoadPulse Report</div>
-          <p className="muted">Download the selected road survey as CSV.</p>
-          <div className="report-summary">
-            <div><small>Road</small><strong>{result.location?.road_name || 'Unavailable'}</strong></div>
-            <div><small>Health Score</small><strong>{result.summary?.health_score ?? '—'} / 100</strong></div>
-            <div><small>Defects</small><strong>{result.summary?.total_defects ?? 0}</strong></div>
-            <div><small>Roughness</small><strong>{result.summary?.roughness_label || 'Unavailable'}</strong></div>
-          </div>
-          <button className="primary-button compact" onClick={() => downloadReport(result)}><Download size={17} /> Download CSV report</button>
-        </section>
-      ) : <EmptyDashboard onUpload={() => newSurvey('upload')} onRecord={() => newSurvey('record')} />
-    }
-
-    return result
-      ? <AnalysisResults result={result} />
-      : <EmptyDashboard onUpload={() => newSurvey('upload')} onRecord={() => newSurvey('record')} />
+    return (
+      <UnifiedDashboard
+        result={result}
+        surveys={surveys}
+        mapResults={mapResults}
+        onUpload={() => newSurvey('upload')}
+        onRecord={() => newSurvey('record')}
+        onOpenAnalysis={openSurvey}
+      />
+    )
   }
 
   const pageTitle = activePage === 'dashboard'
     ? 'Dashboard'
     : activePage === 'upload'
-      ? 'Upload Survey'
+      ? 'Analyze Road Video'
       : activePage === 'record'
-        ? 'Record with Phone'
-        : activePage === 'surveys'
-          ? 'Survey History'
-          : activePage === 'map'
-            ? 'Map View'
-            : activePage === 'defects'
-              ? 'Defects'
-              : activePage === 'reports'
-                ? 'Reports'
-                : 'About'
+        ? 'Record Road Video'
+        : activePage === 'history'
+          ? 'History & Reports'
+          : 'About'
 
   return (
     <div className="app-shell">
@@ -979,7 +1236,7 @@ function App() {
           <div className="top-actions">
             <div className="live-chip"><span /> {backendHealth?.ok ? 'System online' : 'Checking system'}</div>
             {result && activePage !== 'upload' && activePage !== 'record' && (
-              <button className="ghost-button compact" onClick={() => newSurvey('upload')}><RotateCcw size={15} /> New Survey</button>
+              <button className="ghost-button compact" onClick={() => newSurvey('upload')}><RotateCcw size={15} /> New Video Analysis</button>
             )}
           </div>
         </header>

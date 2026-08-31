@@ -9,11 +9,12 @@ React/Vite + FastAPI RoadPulse MVP for road-damage detection, automatic GPS road
 - FastAPI background job API with live progress polling.
 - Your trained Ultralytics `best.pt` model is loaded server-side.
 - Automatic YOLO settings: users do not set confidence or frame stride in the UI.
-- Adaptive frame stride based on video duration, low model confidence threshold (`0.05` by default), 640px inference.
+- One YOLO analysis frame per source-video second (a 30 FPS video analyzes one frame and skips 29), low model confidence threshold (`0.05` by default), 640px inference.
 - Lightweight temporal deduplication so the same visible defect is not counted every frame.
 - Evidence images, defect table, defect distribution chart and downloadable CSV report.
-- Persistent SQLite survey history: completed surveys survive **New Survey**, browser refreshes and backend restarts.
-- Dedicated **Defects** workspace with filtering/search instead of repeating the dashboard.
+- Persistent SQLite analysis history: completed road analyses survive **New Video Analysis**, browser refreshes and backend restarts.
+- Unified **Dashboard** with road rankings, all-road map, selected-road results and filterable defect intelligence.
+- Combined **History & Reports** page for reopening saved analyses and downloading the selected CSV report.
 - Uploaded-video GPS: backend checks ExifTool/FFprobe metadata and also includes a built-in raw QuickTime ISO6709 scanner, so common phone GPS metadata can still be found on Windows even when those command-line tools are missing.
 - Optional synchronized GPS JSON sidecar can be attached when an export stripped the video metadata.
 - Phone survey GPS: browser requires an initial high-accuracy GPS fix before recording, then records a timestamped `watchPosition()` track while video is recorded.
@@ -24,8 +25,9 @@ React/Vite + FastAPI RoadPulse MVP for road-damage detection, automatic GPS road
 ## What changed in v2.1
 
 1. **GPS reliability:** built-in QuickTime ISO6709 scan, clearer GPS diagnostics, an optional synchronized GPS JSON fallback, and phone mode now waits for a real GPS fix before recording.
-2. **Survey persistence:** results are stored in `data/roadpulse.db` using SQLite and exposed through `/api/surveys`.
-3. **Defects page:** now a separate filterable/searchable defect workspace.
+2. **Analysis persistence:** results are stored in `data/roadpulse.db` using SQLite and exposed through the compatible `/api/surveys` API.
+3. **Unified operations view:** dashboard, road rankings, network map and defects now share one page; saved analysis history and reports share a second page.
+4. **Predictable video sampling:** YOLO runs at one frame per video second, regardless of the source frame rate.
 
 ## Accuracy / honesty constraints
 
@@ -89,7 +91,7 @@ uvicorn app.main:app --reload --port 8000
 
 Check `http://localhost:8000/api/health`. It should report `model_loaded: true`, four model classes, and a `gps_capabilities` object.
 
-Saved surveys are available at `http://localhost:8000/api/surveys`.
+Saved analyses are available at `http://localhost:8000/api/surveys` (the internal API route is retained for compatibility).
 
 ### Frontend
 
@@ -114,7 +116,7 @@ Open `http://localhost:3000`.
 
 ## Phone recording requirements
 
-Phone recording needs HTTPS in production because browser geolocation and motion sensors are secure-context features. On iPhone/iPad, motion permission must be requested from a user action; RoadPulse requests it when **Start road survey** is pressed.
+Phone recording needs HTTPS in production because browser geolocation and motion sensors are secure-context features. On iPhone/iPad, motion permission must be requested from a user action; RoadPulse requests it when **Start road video** is pressed.
 
 ## Uploaded video location
 
@@ -122,13 +124,10 @@ RoadPulse tries ExifTool first, then FFprobe, for GPS tags such as QuickTime ISO
 
 ## Developer-only automatic analysis tuning
 
-The normal dashboard exposes no model thresholds. Developers can override defaults with backend environment variables:
+The normal dashboard exposes no model thresholds. Developers can override the detection-confidence default with a backend environment variable. Frame sampling is fixed at one analyzed frame per video second:
 
 ```text
 ROADPULSE_DETECTION_CONFIDENCE=0.05
-ROADPULSE_SHORT_VIDEO_STRIDE=1
-ROADPULSE_MEDIUM_VIDEO_STRIDE=2
-ROADPULSE_LONG_VIDEO_STRIDE=3
 ```
 
 ## Validation performed

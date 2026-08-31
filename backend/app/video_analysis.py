@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
+import subprocess
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,9 +14,6 @@ import numpy as np
 from .config import (
     DETECTION_CONFIDENCE,
     EVIDENCE_DIR,
-    LONG_VIDEO_STRIDE,
-    MEDIUM_VIDEO_STRIDE,
-    SHORT_VIDEO_STRIDE,
     GOOGLE_MAPS_API_KEY,
 )
 from .geo import extract_embedded_gps, normalize_gps_points, nearest_gps, reverse_geocode, snap_route
@@ -29,6 +28,19 @@ CANONICAL_CLASSES = {
     'alligator_crack': 'fatigue_crack',
     'pothole': 'pothole',
 }
+
+
+def _ffmpeg_executable() -> str | None:
+    """Return a usable FFmpeg binary for browser-compatible video output."""
+    system_ffmpeg = shutil.which('ffmpeg')
+    if system_ffmpeg:
+        return system_ffmpeg
+
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
 
 
 def _read_json(path: Path | None):
@@ -123,15 +135,6 @@ def _match_tracks(detections, tracks, frame_idx, frame_diag, max_age_frames):
         used.add(best_id)
 
 
-def _automatic_frame_stride(duration_sec: float | None) -> int:
-    """Automatically balances detector sensitivity and processing time."""
-    if duration_sec is None or duration_sec <= 90:
-        return max(1, SHORT_VIDEO_STRIDE)
-    if duration_sec <= 300:
-        return max(1, MEDIUM_VIDEO_STRIDE)
-    return max(1, LONG_VIDEO_STRIDE)
-
-
 def _gps_accuracy(points: list[dict]) -> float | None:
     values = []
     for p in points:
@@ -220,10 +223,40 @@ def analyze_video(
 
     duration = total_frames / fps if total_frames and fps else None
     confidence = float(np.clip(DETECTION_CONFIDENCE, 0.001, 0.95))
-    frame_stride = _automatic_frame_stride(duration)
+    # Run inference once per second of source video. For a 30 FPS recording this
+    # analyzes frame 0, skips the following 29 frames, then analyzes frame 30.
+    frame_stride = max(1, int(round(fps)))
+    analysis_sampling_fps = fps / frame_stride
 
     evidence_dir = EVIDENCE_DIR / job_id
     evidence_dir.mkdir(parents=True, exist_ok=True)
+    # Create a full analyzed output video
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+
+    raw_annotated_path = evidence_dir / "annotated_raw.mp4"
+    final_annotated_path = evidence_dir / "annotated.mp4"
+
+    annotated_video_url = None
+    video_writer = None
+
+    if frame_width > 0 and frame_height > 0:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+        video_writer = cv2.VideoWriter(
+            str(raw_annotated_path),
+            fourcc,
+            fps,
+            (frame_width, frame_height),
+        )
+
+        if not video_writer.isOpened():
+            video_writer.release()
+            video_writer = None
+
+            warnings.append(
+                "The analyzed video could not be created."
+            )
 
     tracks = {}
     motion_values = []
@@ -233,7 +266,7 @@ def analyze_video(
 
     # Keep tracking IDs alive for about one second of raw video time.
     max_age_frames = max(8, int(round(fps * 1.0)))
-    # Video-motion fallback is sampled independently of YOLO's adaptive stride.
+    # Video-motion fallback is sampled independently of YOLO's one-second stride.
     motion_stride = 1 if duration is None or duration <= 120 else 2
 
     while True:
@@ -253,12 +286,22 @@ def analyze_video(
             prev_motion_gray = gray
 
         if frame_idx % frame_stride != 0:
+            # Keep original frame in output video
+            if video_writer is not None:
+                video_writer.write(frame)
+
             frame_idx += 1
             continue
 
         analyzed += 1
         t_sec = frame_idx / fps
         result = model.predict(frame, conf=confidence, imgsz=640, verbose=False)[0]
+        # Draw YOLO bounding boxes onto this frame
+        if video_writer is not None:
+            annotated_frame = result.plot()
+            video_writer.write(annotated_frame)
+
+        detections = []
         detections = []
 
         if result.boxes is not None and len(result.boxes) > 0:
@@ -288,10 +331,65 @@ def analyze_video(
         if progress_cb and total_frames > 0 and analyzed % 3 == 0:
             progress_cb(
                 min(88.0, 8.0 + (frame_idx / total_frames) * 80.0),
-                'Running YOLO and synchronizing detections…',
+                'Running YOLO at one frame per second and synchronizing detections…',
             )
 
     cap.release()
+    if video_writer is not None:
+        video_writer.release()
+
+        try:
+            ffmpeg_executable = _ffmpeg_executable()
+            if not ffmpeg_executable:
+                raise RuntimeError('FFmpeg is unavailable.')
+
+            subprocess.run(
+                [
+                    ffmpeg_executable,
+                    "-y",
+                    "-i",
+                    str(raw_annotated_path),
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "23",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-tag:v",
+                    "avc1",
+                    "-movflags",
+                    "+faststart",
+                    "-an",
+                    str(final_annotated_path),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            raw_annotated_path.unlink(missing_ok=True)
+
+            annotated_video_url = (
+                f"/evidence/{job_id}/annotated.mp4"
+            )
+
+        except Exception:
+
+            try:
+                raw_annotated_path.replace(
+                    final_annotated_path
+                )
+
+                annotated_video_url = (
+                    f"/evidence/{job_id}/annotated.mp4"
+                )
+
+            except Exception:
+                warnings.append(
+                    "The analyzed video could not be finalized."
+                )
 
     defects = []
     counts = {
@@ -416,7 +514,9 @@ def analyze_video(
             'frames_analyzed': analyzed,
             'total_frames': total_frames,
             'analysis_frame_stride': frame_stride,
+            'analysis_sampling_fps': analysis_sampling_fps,
             'detection_confidence': confidence,
+            'annotated_video_url': annotated_video_url,
             'processed_at': datetime.now(timezone.utc).isoformat(),
         },
         'defects': defects,
