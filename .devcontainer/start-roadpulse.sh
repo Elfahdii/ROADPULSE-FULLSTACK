@@ -16,18 +16,6 @@ if ! curl --silent --fail http://127.0.0.1:8000/api/health >/dev/null 2>&1; then
   )
 fi
 
-for _ in $(seq 1 120); do
-  if curl --silent --fail http://127.0.0.1:8000/api/health >/dev/null 2>&1; then
-    break
-  fi
-  sleep 1
-done
-
-if ! curl --silent --fail http://127.0.0.1:8000/api/health >/dev/null 2>&1; then
-  echo "RoadPulse backend did not become ready. See ${runtime_dir}/backend.log" >&2
-  exit 1
-fi
-
 if ! curl --silent --fail http://127.0.0.1:5173 >/dev/null 2>&1; then
   (
     cd "${repo_root}"
@@ -36,4 +24,5 @@ if ! curl --silent --fail http://127.0.0.1:5173 >/dev/null 2>&1; then
   )
 fi
 
-echo "RoadPulse is starting on forwarded port 5173. Set that port's visibility to Public."
+echo "RoadPulse frontend is starting on forwarded port 5173."
+echo "The backend may briefly show offline while the YOLO model warms up."
