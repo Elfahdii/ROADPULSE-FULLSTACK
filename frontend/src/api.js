@@ -13,7 +13,9 @@ export async function createAnalysisJob({ videoFile, gpsFile, motionFile, onUplo
   if (motionFile) form.append('motion_json', motionFile)
 
   const response = await axios.post(`${API_URL}/api/jobs/analysis`, form, {
-    headers: { 'Content-Type': 'multipart/form-data' },
+    // Do not set Content-Type here. The browser must add the multipart
+    // boundary itself; forcing the header can make mobile Safari send only
+    // the CORS preflight and abort before the video POST begins.
     onUploadProgress: event => {
       if (!onUploadProgress) return
       if (!event.total) return onUploadProgress(null)

@@ -384,12 +384,33 @@ function RecordSurvey({ onStarted }) {
         )
       })
 
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false })
+      // Keep phone recordings uploadable and within the backend's memory
+      // budget. Unrestricted mobile cameras commonly default to 4K.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { ideal: 'environment' },
+          width: { ideal: 1280, max: 1280 },
+          height: { ideal: 720, max: 720 },
+          frameRate: { ideal: 30, max: 30 },
+        },
+        audio: false,
+      })
       streamRef.current = stream
       if (previewRef.current) previewRef.current.srcObject = stream
 
       const mimeType = pickMimeType()
-      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined)
+      const recorderOptions = {
+        ...(mimeType ? { mimeType } : {}),
+        videoBitsPerSecond: 2_500_000,
+      }
+      let recorder
+      try {
+        recorder = new MediaRecorder(stream, recorderOptions)
+      } catch {
+        // Older mobile browsers may reject the bitrate option even though
+        // MediaRecorder itself is supported.
+        recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined)
+      }
       recorderRef.current = recorder
       chunksRef.current = []
       motionRef.current = []
