@@ -15,6 +15,7 @@ FRONTEND_ORIGIN = os.getenv('FRONTEND_ORIGIN', 'http://localhost:5173').strip()
 DETECTION_CONFIDENCE = float(os.getenv('ROADPULSE_DETECTION_CONFIDENCE', '0.05'))
 INFERENCE_SIZE = max(256, int(os.getenv('ROADPULSE_INFERENCE_SIZE', '640')))
 TORCH_NUM_THREADS = max(1, int(os.getenv('ROADPULSE_TORCH_THREADS', '1')))
+VIDEO_MAX_DIMENSION = max(320, int(os.getenv('ROADPULSE_VIDEO_MAX_DIMENSION', '960')))
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)

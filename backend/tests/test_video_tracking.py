@@ -7,6 +7,7 @@ from app.video_analysis import (
     _motion_sampling_stride,
     _prepare_motion_frame,
     _predicted_box,
+    _scaled_video_dimensions,
 )
 
 
@@ -179,3 +180,12 @@ def test_roughness_motion_frame_is_small_and_grayscale():
 
     assert gray.ndim == 2
     assert gray.shape == (480, 270)
+
+
+def test_large_video_is_scaled_to_memory_safe_even_dimensions():
+    assert _scaled_video_dimensions(1280, 720, max_dimension=960) == (960, 540)
+    assert _scaled_video_dimensions(1080, 1920, max_dimension=960) == (540, 960)
+
+
+def test_small_video_dimensions_are_preserved():
+    assert _scaled_video_dimensions(640, 360, max_dimension=960) == (640, 360)

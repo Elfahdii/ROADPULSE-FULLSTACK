@@ -16,6 +16,7 @@ from .config import (
     EVIDENCE_DIR,
     GOOGLE_MAPS_API_KEY,
     INFERENCE_SIZE,
+    VIDEO_MAX_DIMENSION,
 )
 from .geo import extract_embedded_gps, normalize_gps_points, nearest_gps, reverse_geocode, snap_route
 from .health import calculate_health
@@ -103,7 +104,8 @@ class _FFmpegVideoWriter:
     def write(self, frame):
         if not self.isOpened():
             raise RuntimeError('FFmpeg video encoder stopped unexpectedly.')
-        self._process.stdin.write(np.ascontiguousarray(frame, dtype=np.uint8).tobytes())
+        contiguous = np.ascontiguousarray(frame, dtype=np.uint8)
+        self._process.stdin.write(memoryview(contiguous))
 
     def release(self):
         if self._closed:
@@ -136,6 +138,16 @@ def _prepare_motion_frame(frame: np.ndarray, max_dimension: int = MOTION_MAX_DIM
             interpolation=cv2.INTER_AREA,
         )
     return gray
+
+
+def _scaled_video_dimensions(width: int, height: int, max_dimension: int = VIDEO_MAX_DIMENSION) -> tuple[int, int]:
+    """Return even H.264 dimensions bounded by the configured long side."""
+    if width <= 0 or height <= 0:
+        return width, height
+    scale = min(1.0, max_dimension / max(width, height))
+    scaled_width = max(2, int(round(width * scale / 2.0)) * 2)
+    scaled_height = max(2, int(round(height * scale / 2.0)) * 2)
+    return scaled_width, scaled_height
 
 
 def _read_json(path: Path | None):
@@ -394,7 +406,10 @@ def _gps_accuracy(points: list[dict]) -> float | None:
 
 
 def _draw_evidence(det: dict) -> np.ndarray:
-    frame = det['frame'].copy()
+    encoded = np.frombuffer(det['frame_jpeg'], dtype=np.uint8)
+    frame = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+    if frame is None:
+        raise RuntimeError('An evidence frame could not be decoded.')
     x1, y1, x2, y2 = [int(round(v)) for v in det['box']]
     color = (70, 90, 255) if det['class_name'] == 'pothole' else (30, 180, 255)
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
@@ -475,8 +490,9 @@ def analyze_video(
     evidence_dir = EVIDENCE_DIR / job_id
     evidence_dir.mkdir(parents=True, exist_ok=True)
     # Create a full analyzed output video
-    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    source_frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    source_frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    frame_width, frame_height = _scaled_video_dimensions(source_frame_width, source_frame_height)
 
     final_annotated_path = evidence_dir / "annotated.mp4"
 
@@ -528,6 +544,11 @@ def analyze_video(
         if not ok:
             break
 
+        if frame_width > 0 and frame_height > 0 and (
+            frame.shape[1] != frame_width or frame.shape[0] != frame_height
+        ):
+            frame = cv2.resize(frame, (frame_width, frame_height), interpolation=cv2.INTER_AREA)
+
         # Roughness proxy from camera motion, independent of detector stride.
         if frame_idx % motion_stride == 0:
             gray = _prepare_motion_frame(frame)
@@ -557,6 +578,14 @@ def analyze_video(
             cls_ids = result.boxes.cls.int().cpu().tolist()
             confs = result.boxes.conf.cpu().tolist()
             boxes = result.boxes.xyxy.cpu().tolist()
+            encoded_ok, encoded_frame = cv2.imencode(
+                '.jpg',
+                frame,
+                [cv2.IMWRITE_JPEG_QUALITY, 88],
+            )
+            if not encoded_ok:
+                raise RuntimeError('An evidence frame could not be encoded.')
+            evidence_frame_jpeg = encoded_frame.tobytes()
 
             for cls_id, conf, box in zip(cls_ids, confs, boxes):
                 if cls_id not in class_names:
@@ -569,10 +598,9 @@ def analyze_video(
                     't_sec': float(t_sec),
                     'latitude': point['latitude'] if point else None,
                     'longitude': point['longitude'] if point else None,
-                    # OpenCV returns a new array for every cap.read(). Sharing
-                    # this immutable frame across detections avoids retaining
-                    # one full-resolution copy for every bounding box.
-                    'frame': frame,
+                    # Tracks can survive for many seconds. Retain one compact
+                    # JPEG payload instead of a multi-megabyte raw BGR array.
+                    'frame_jpeg': evidence_frame_jpeg,
                 })
 
         detections = _deduplicate_frame_detections(detections)
