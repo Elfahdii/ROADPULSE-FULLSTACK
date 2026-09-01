@@ -11,6 +11,8 @@ dependencies = [
     "opencv-python-headless>=4.10,<5",
     "httpx>=0.28,<1",
     "imageio-ffmpeg>=0.6,<1",
+    "torch==2.13.0",
+    "torchvision==0.28.0",
     "ultralytics>=8.3,<9",
 ]
 
@@ -22,3 +24,12 @@ entrypoint = "app.main:app"
 # dependency. The API already uses the headless wheel above, which is the
 # correct build for FastAPI Cloud and does not require libGL.so.1.
 exclude-dependencies = ["opencv-python"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

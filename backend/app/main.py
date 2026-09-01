@@ -17,9 +17,14 @@ from .storage import get_survey, init_db, list_surveys, save_survey
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # Pay the model import/initialization cost once during backend startup so
-    # the first user analysis begins immediately after its upload is saved.
-    detector.warmup()
+    # Start serving health/readiness requests immediately. Model loading is
+    # expensive on small cloud instances, so warm it in a daemon thread rather
+    # than blocking FastAPI's startup lifecycle.
+    threading.Thread(
+        target=detector.warmup,
+        name='roadpulse-model-warmup',
+        daemon=True,
+    ).start()
     yield
 
 
