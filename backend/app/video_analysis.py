@@ -15,6 +15,7 @@ from .config import (
     DETECTION_CONFIDENCE,
     EVIDENCE_DIR,
     GOOGLE_MAPS_API_KEY,
+    INFERENCE_SIZE,
 )
 from .geo import extract_embedded_gps, normalize_gps_points, nearest_gps, reverse_geocode, snap_route
 from .health import calculate_health
@@ -74,7 +75,11 @@ class _FFmpegVideoWriter:
                 '-c:v',
                 'libx264',
                 '-preset',
-                'veryfast',
+                'ultrafast',
+                '-tune',
+                'zerolatency',
+                '-threads',
+                '1',
                 '-crf',
                 '23',
                 '-pix_fmt',
@@ -545,7 +550,7 @@ def analyze_video(
 
         analyzed += 1
         t_sec = frame_idx / fps
-        result = model.predict(frame, conf=confidence, imgsz=640, verbose=False)[0]
+        result = model.predict(frame, conf=confidence, imgsz=INFERENCE_SIZE, verbose=False)[0]
         detections = []
 
         if result.boxes is not None and len(result.boxes) > 0:
@@ -564,7 +569,10 @@ def analyze_video(
                     't_sec': float(t_sec),
                     'latitude': point['latitude'] if point else None,
                     'longitude': point['longitude'] if point else None,
-                    'frame': frame.copy(),
+                    # OpenCV returns a new array for every cap.read(). Sharing
+                    # this immutable frame across detections avoids retaining
+                    # one full-resolution copy for every bounding box.
+                    'frame': frame,
                 })
 
         detections = _deduplicate_frame_detections(detections)
@@ -576,6 +584,7 @@ def analyze_video(
             frame.shape[0],
             max_age_frames=max_age_frames,
         )
+        del result
 
         if video_writer is not None:
             video_writer.write(

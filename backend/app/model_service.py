@@ -1,7 +1,7 @@
 from __future__ import annotations
 from pathlib import Path
 from threading import Lock
-from .config import MODEL_PATH
+from .config import INFERENCE_SIZE, MODEL_PATH, TORCH_NUM_THREADS
 
 EXPECTED_ALIASES = {
     'longitudinal_crack': 'longitudinal_crack',
@@ -30,6 +30,17 @@ class DetectorService:
                 self.error = f'Model file not found: {MODEL_PATH}'
                 return None
             try:
+                import torch
+
+                # Small cloud instances cannot afford PyTorch's default CPU
+                # worker pools. One thread is also appropriate for a service
+                # with less than one vCPU.
+                torch.set_num_threads(TORCH_NUM_THREADS)
+                try:
+                    torch.set_num_interop_threads(TORCH_NUM_THREADS)
+                except RuntimeError:
+                    pass
+
                 from ultralytics import YOLO
                 model = YOLO(str(MODEL_PATH))
                 names = {int(k): str(v).strip().lower().replace(' ', '_') for k, v in model.names.items()}
@@ -56,8 +67,8 @@ class DetectorService:
             try:
                 import numpy as np
 
-                blank_frame = np.zeros((640, 640, 3), dtype=np.uint8)
-                model.predict(blank_frame, conf=0.001, imgsz=640, verbose=False)
+                blank_frame = np.zeros((INFERENCE_SIZE, INFERENCE_SIZE, 3), dtype=np.uint8)
+                model.predict(blank_frame, conf=0.001, imgsz=INFERENCE_SIZE, verbose=False)
                 self._warmed_up = True
                 self.warmup_error = None
             except Exception as e:

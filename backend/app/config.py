@@ -13,6 +13,8 @@ FRONTEND_ORIGIN = os.getenv('FRONTEND_ORIGIN', 'http://localhost:5173').strip()
 # by the developer without exposing a slider in the dashboard. Frame sampling is
 # fixed at one analyzed frame per source-video second in video_analysis.py.
 DETECTION_CONFIDENCE = float(os.getenv('ROADPULSE_DETECTION_CONFIDENCE', '0.05'))
+INFERENCE_SIZE = max(256, int(os.getenv('ROADPULSE_INFERENCE_SIZE', '640')))
+TORCH_NUM_THREADS = max(1, int(os.getenv('ROADPULSE_TORCH_THREADS', '1')))
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
