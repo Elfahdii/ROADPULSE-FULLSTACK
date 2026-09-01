@@ -15,7 +15,10 @@ class DetectorService:
     def __init__(self):
         self._model = None
         self._lock = Lock()
+        self._warmup_lock = Lock()
+        self._warmed_up = False
         self.error = None
+        self.warmup_error = None
 
     def load(self):
         if self._model is not None:
@@ -39,8 +42,37 @@ class DetectorService:
                 self._model = None
         return self._model
 
+    def warmup(self):
+        """Load the model and run one blank inference before the first upload."""
+        model = self.load()
+        if model is None:
+            return False
+        if self._warmed_up:
+            return True
+
+        with self._warmup_lock:
+            if self._warmed_up:
+                return True
+            try:
+                import numpy as np
+
+                blank_frame = np.zeros((640, 640, 3), dtype=np.uint8)
+                model.predict(blank_frame, conf=0.001, imgsz=640, verbose=False)
+                self._warmed_up = True
+                self.warmup_error = None
+            except Exception as e:
+                # A warm-up failure must not stop the API from starting; the
+                # normal analysis path can still report the underlying error.
+                self.warmup_error = str(e)
+                return False
+        return True
+
     @property
     def model(self):
         return self.load()
+
+    @property
+    def warmed_up(self):
+        return self._warmed_up
 
 detector = DetectorService()

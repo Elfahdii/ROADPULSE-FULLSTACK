@@ -1,4 +1,5 @@
 from __future__ import annotations
+from contextlib import asynccontextmanager
 import shutil
 import threading
 import uuid
@@ -13,7 +14,16 @@ from .model_service import detector
 from .geo import gps_tool_status
 from .storage import get_survey, init_db, list_surveys, save_survey
 
-app = FastAPI(title='RoadPulse API', version='2.0.0')
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Pay the model import/initialization cost once during backend startup so
+    # the first user analysis begins immediately after its upload is saved.
+    detector.warmup()
+    yield
+
+
+app = FastAPI(title='RoadPulse API', version='2.0.0', lifespan=lifespan)
 origins = [o.strip() for o in FRONTEND_ORIGIN.split(',') if o.strip()]
 app.add_middleware(
     CORSMiddleware,
@@ -62,7 +72,9 @@ def health():
     return {
         'ok': True,
         'model_loaded': model is not None,
+        'model_warmed_up': detector.warmed_up,
         'model_error': detector.error,
+        'model_warmup_error': detector.warmup_error,
         'model_classes': getattr(model, 'names', None) if model is not None else None,
         'gps_capabilities': gps_tool_status(),
     }

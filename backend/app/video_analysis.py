@@ -29,6 +29,9 @@ CANONICAL_CLASSES = {
     'pothole': 'pothole',
 }
 
+MOTION_SAMPLE_FPS = 5.0
+MOTION_MAX_DIMENSION = 480
+
 
 def _ffmpeg_executable() -> str | None:
     """Return a usable FFmpeg binary for browser-compatible video output."""
@@ -41,6 +44,93 @@ def _ffmpeg_executable() -> str | None:
         return imageio_ffmpeg.get_ffmpeg_exe()
     except Exception:
         return None
+
+
+class _FFmpegVideoWriter:
+    """Encode browser-compatible H.264 directly from OpenCV BGR frames."""
+
+    def __init__(self, output_path: Path, fps: float, frame_width: int, frame_height: int):
+        ffmpeg_executable = _ffmpeg_executable()
+        if not ffmpeg_executable:
+            raise RuntimeError('FFmpeg is unavailable.')
+
+        self._process = subprocess.Popen(
+            [
+                ffmpeg_executable,
+                '-y',
+                '-loglevel',
+                'error',
+                '-f',
+                'rawvideo',
+                '-pix_fmt',
+                'bgr24',
+                '-video_size',
+                f'{frame_width}x{frame_height}',
+                '-framerate',
+                f'{fps:.6f}',
+                '-i',
+                'pipe:0',
+                '-an',
+                '-c:v',
+                'libx264',
+                '-preset',
+                'veryfast',
+                '-crf',
+                '23',
+                '-pix_fmt',
+                'yuv420p',
+                '-tag:v',
+                'avc1',
+                '-movflags',
+                '+faststart',
+                str(output_path),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            bufsize=1024 * 1024,
+        )
+        self._closed = False
+
+    def isOpened(self):
+        return not self._closed and self._process.poll() is None and self._process.stdin is not None
+
+    def write(self, frame):
+        if not self.isOpened():
+            raise RuntimeError('FFmpeg video encoder stopped unexpectedly.')
+        self._process.stdin.write(np.ascontiguousarray(frame, dtype=np.uint8).tobytes())
+
+    def release(self):
+        if self._closed:
+            return
+        self._closed = True
+        if self._process.stdin is not None:
+            self._process.stdin.close()
+        return_code = self._process.wait()
+        if return_code != 0:
+            raise RuntimeError(f'FFmpeg video encoder exited with code {return_code}.')
+
+
+def _motion_sampling_stride(fps: float, target_fps: float = MOTION_SAMPLE_FPS) -> int:
+    """Return a source-frame stride close to the requested motion sample rate."""
+    if fps <= 0 or target_fps <= 0:
+        return 1
+    return max(1, int(round(fps / target_fps)))
+
+
+def _prepare_motion_frame(frame: np.ndarray, max_dimension: int = MOTION_MAX_DIMENSION) -> np.ndarray:
+    """Create a small grayscale frame for the optical-flow roughness proxy."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    height, width = gray.shape
+    longest_side = max(height, width)
+    if max_dimension > 0 and longest_side > max_dimension:
+        scale = max_dimension / longest_side
+        gray = cv2.resize(
+            gray,
+            (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+    return gray
 
 
 def _read_json(path: Path | None):
@@ -92,47 +182,196 @@ def _iou(a, b):
     return inter / union if union > 0 else 0.0
 
 
-def _match_tracks(detections, tracks, frame_idx, frame_diag, max_age_frames):
-    used = set()
-    for det in detections:
-        cx, cy = _center(det['box'])
-        best_id = None
-        best_score = -1e9
+def _box_area(box):
+    x1, y1, x2, y2 = box
+    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
 
-        for tid, tr in tracks.items():
-            if tid in used:
+
+def _intersection_over_smaller(a, b):
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    intersection = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    smaller = min(_box_area(a), _box_area(b))
+    return intersection / smaller if smaller > 0 else 0.0
+
+
+def _predicted_box(track, frame_idx):
+    """Move a track using its last measured box velocity."""
+    gap = max(0, frame_idx - track['last_frame'])
+    velocity = track.get('velocity') or [0.0, 0.0, 0.0, 0.0]
+    return [float(value + speed * gap) for value, speed in zip(track['box'], velocity)]
+
+
+def _clip_box(box, frame_width, frame_height):
+    x1, y1, x2, y2 = box
+    x1 = max(0.0, min(float(frame_width - 1), x1))
+    y1 = max(0.0, min(float(frame_height - 1), y1))
+    x2 = max(0.0, min(float(frame_width - 1), x2))
+    y2 = max(0.0, min(float(frame_height - 1), y2))
+    if x2 - x1 < 3 or y2 - y1 < 3:
+        return None
+    return [x1, y1, x2, y2]
+
+
+def _compatible_track_class(track_class, detection_class):
+    if track_class == detection_class:
+        return True
+    crack_classes = {
+        'longitudinal_crack',
+        'transverse_crack',
+        'fatigue_crack',
+    }
+    return track_class in crack_classes and detection_class in crack_classes
+
+
+def _deduplicate_frame_detections(detections):
+    """Suppress nested/overlapping YOLO boxes for the same visible defect."""
+    kept = []
+    for detection in sorted(detections, key=lambda item: item['confidence'], reverse=True):
+        duplicate = any(
+            _compatible_track_class(existing['class_name'], detection['class_name'])
+            and (
+                _iou(existing['box'], detection['box']) >= 0.15
+                or _intersection_over_smaller(existing['box'], detection['box']) >= 0.60
+            )
+            for existing in kept
+        )
+        if not duplicate:
+            kept.append(detection)
+    return kept
+
+
+def _match_tracks(detections, tracks, frame_idx, frame_width, frame_height, max_age_frames):
+    """Assign detections to persistent road-defect tracks.
+
+    A forward-facing road camera makes a crack move mostly downward and grow
+    between one-second samples. Matching only by IoU or a small center radius
+    therefore counted the same crack more than once. This matcher predicts the
+    previous track's motion and also accepts plausible perspective movement.
+    """
+    frame_diag = math.hypot(frame_width, frame_height)
+    candidates = []
+
+    for det_index, det in enumerate(detections):
+        det_center = _center(det['box'])
+        det_area = max(_box_area(det['box']), 1.0)
+
+        for track_id, track in tracks.items():
+            if not _compatible_track_class(track['class_name'], det['class_name']):
                 continue
-            if tr['class_name'] != det['class_name']:
+
+            gap = frame_idx - track['last_frame']
+            if gap <= 0 or gap > max_age_frames:
                 continue
-            if frame_idx - tr['last_frame'] > max_age_frames:
+
+            predicted = _predicted_box(track, frame_idx)
+            predicted_center = _center(predicted)
+            previous_center = _center(track['box'])
+            predicted_distance = math.hypot(
+                det_center[0] - predicted_center[0],
+                det_center[1] - predicted_center[1],
+            ) / max(frame_diag, 1.0)
+            previous_distance = math.hypot(
+                det_center[0] - previous_center[0],
+                det_center[1] - previous_center[1],
+            ) / max(frame_diag, 1.0)
+            x_shift = abs(det_center[0] - previous_center[0]) / max(frame_width, 1.0)
+            y_shift = (det_center[1] - previous_center[1]) / max(frame_height, 1.0)
+            area_ratio = det_area / max(_box_area(track['box']), 1.0)
+            overlap = max(_iou(det['box'], predicted), _iou(det['box'], track['box']))
+
+            plausible_road_motion = (
+                x_shift <= 0.28
+                and -0.10 <= y_shift <= 0.70
+                and 0.12 <= area_ratio <= 12.0
+            )
+            if overlap < 0.02 and predicted_distance > 0.28 and not plausible_road_motion:
                 continue
 
-            ox, oy = _center(tr['box'])
-            dist = math.hypot(cx - ox, cy - oy) / max(frame_diag, 1.0)
-            overlap = _iou(det['box'], tr['box'])
+            size_penalty = abs(math.log(max(area_ratio, 1e-6)))
+            score = (
+                overlap * 3.0
+                + max(0.0, 1.0 - predicted_distance)
+                + 0.45 * max(0.0, 1.0 - previous_distance)
+                + (0.35 if plausible_road_motion else 0.0)
+                - 0.08 * size_penalty
+            )
+            candidates.append((score, det_index, track_id))
 
-            # Match the same visible defect across nearby frames.
-            if overlap >= 0.08 or dist <= 0.14:
-                score = overlap - dist
-                if score > best_score:
-                    best_score = score
-                    best_id = tid
+    assignments = {}
+    used_tracks = set()
+    for _, det_index, track_id in sorted(candidates, reverse=True):
+        if det_index in assignments or track_id in used_tracks:
+            continue
+        assignments[det_index] = track_id
+        used_tracks.add(track_id)
 
-        if best_id is None:
-            best_id = str(uuid.uuid4())
-            tracks[best_id] = {
+    for det_index, det in enumerate(detections):
+        track_id = assignments.get(det_index)
+        if track_id is None:
+            track_id = str(uuid.uuid4())
+            tracks[track_id] = {
                 'class_name': det['class_name'],
                 'box': det['box'],
                 'last_frame': frame_idx,
+                'velocity': [0.0, 0.0, 0.0, 0.0],
+                'hits': 1,
                 'best': det,
             }
-        else:
-            tracks[best_id]['box'] = det['box']
-            tracks[best_id]['last_frame'] = frame_idx
-            if det['confidence'] > tracks[best_id]['best']['confidence']:
-                tracks[best_id]['best'] = det
+            continue
 
-        used.add(best_id)
+        track = tracks[track_id]
+        gap = max(1, frame_idx - track['last_frame'])
+        measured_velocity = [
+            (new_value - old_value) / gap
+            for new_value, old_value in zip(det['box'], track['box'])
+        ]
+        if track.get('hits', 1) <= 1:
+            velocity = measured_velocity
+        else:
+            previous_velocity = track.get('velocity') or [0.0, 0.0, 0.0, 0.0]
+            velocity = [
+                0.65 * measured + 0.35 * previous
+                for measured, previous in zip(measured_velocity, previous_velocity)
+            ]
+
+        track['box'] = det['box']
+        track['last_frame'] = frame_idx
+        track['velocity'] = velocity
+        track['hits'] = track.get('hits', 1) + 1
+        if det['confidence'] > track['best']['confidence']:
+            track['best'] = det
+            track['class_name'] = det['class_name']
+
+
+def _draw_active_tracks(frame, tracks, frame_idx, max_age_frames):
+    """Draw each recent track between YOLO samples until it leaves the view."""
+    height, width = frame.shape[:2]
+    annotated = frame.copy()
+    for track in tracks.values():
+        if frame_idx - track['last_frame'] > max_age_frames:
+            continue
+        box = _clip_box(_predicted_box(track, frame_idx), width, height)
+        if box is None:
+            continue
+        x1, y1, x2, y2 = [int(round(value)) for value in box]
+        color = (70, 90, 255) if track['class_name'] == 'pothole' else (30, 180, 255)
+        confidence = float(track['best']['confidence'])
+        label = f"{track['class_name'].replace('_', ' ')} {confidence:.2f}"
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 3)
+        cv2.putText(
+            annotated,
+            label,
+            (max(0, x1), max(24, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+    return annotated
 
 
 def _gps_accuracy(points: list[dict]) -> float | None:
@@ -234,29 +473,36 @@ def analyze_video(
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
 
-    raw_annotated_path = evidence_dir / "annotated_raw.mp4"
     final_annotated_path = evidence_dir / "annotated.mp4"
 
     annotated_video_url = None
     video_writer = None
 
     if frame_width > 0 and frame_height > 0:
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-
-        video_writer = cv2.VideoWriter(
-            str(raw_annotated_path),
-            fourcc,
-            fps,
-            (frame_width, frame_height),
-        )
-
-        if not video_writer.isOpened():
-            video_writer.release()
-            video_writer = None
-
-            warnings.append(
-                "The analyzed video could not be created."
+        try:
+            # Feed annotated BGR frames directly to FFmpeg. This creates the
+            # browser-compatible H.264 file in one encoding pass instead of
+            # writing an intermediate MP4 and transcoding the whole video.
+            video_writer = _FFmpegVideoWriter(
+                final_annotated_path,
+                fps,
+                frame_width,
+                frame_height,
             )
+        except Exception:
+            # Keep a best-effort OpenCV fallback for environments where FFmpeg
+            # is unavailable. It is single-pass, but browser support may vary.
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            video_writer = cv2.VideoWriter(
+                str(final_annotated_path),
+                fourcc,
+                fps,
+                (frame_width, frame_height),
+            )
+            if not video_writer.isOpened():
+                video_writer.release()
+                video_writer = None
+                warnings.append('The analyzed video could not be created.')
 
     tracks = {}
     motion_values = []
@@ -264,10 +510,13 @@ def analyze_video(
     analyzed = 0
     frame_idx = 0
 
-    # Keep tracking IDs alive for about one second of raw video time.
-    max_age_frames = max(8, int(round(fps * 1.0)))
-    # Video-motion fallback is sampled independently of YOLO's one-second stride.
-    motion_stride = 1 if duration is None or duration <= 120 else 2
+    # Keep an identity through the next one-second YOLO sample and briefly
+    # bridge a missed detection. Motion prediction makes the box leave the
+    # frame naturally instead of creating another count for the same crack.
+    max_age_frames = max(8, int(round(fps * 1.6)))
+    # Five small grayscale samples per second are enough for the prototype
+    # roughness proxy. YOLO remains independently sampled at one frame/second.
+    motion_stride = _motion_sampling_stride(fps)
 
     while True:
         ok, frame = cap.read()
@@ -276,7 +525,7 @@ def analyze_video(
 
         # Roughness proxy from camera motion, independent of detector stride.
         if frame_idx % motion_stride == 0:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = _prepare_motion_frame(frame)
             if prev_motion_gray is not None:
                 val = camera_motion_value(prev_motion_gray, gray)
                 if val is not None:
@@ -286,9 +535,10 @@ def analyze_video(
             prev_motion_gray = gray
 
         if frame_idx % frame_stride != 0:
-            # Keep original frame in output video
             if video_writer is not None:
-                video_writer.write(frame)
+                video_writer.write(
+                    _draw_active_tracks(frame, tracks, frame_idx, max_age_frames)
+                )
 
             frame_idx += 1
             continue
@@ -296,20 +546,12 @@ def analyze_video(
         analyzed += 1
         t_sec = frame_idx / fps
         result = model.predict(frame, conf=confidence, imgsz=640, verbose=False)[0]
-        # Draw YOLO bounding boxes onto this frame
-        if video_writer is not None:
-            annotated_frame = result.plot()
-            video_writer.write(annotated_frame)
-
-        detections = []
         detections = []
 
         if result.boxes is not None and len(result.boxes) > 0:
             cls_ids = result.boxes.cls.int().cpu().tolist()
             confs = result.boxes.conf.cpu().tolist()
             boxes = result.boxes.xyxy.cpu().tolist()
-            h, w = frame.shape[:2]
-            diag = math.hypot(w, h)
 
             for cls_id, conf, box in zip(cls_ids, confs, boxes):
                 if cls_id not in class_names:
@@ -325,7 +567,20 @@ def analyze_video(
                     'frame': frame.copy(),
                 })
 
-            _match_tracks(detections, tracks, frame_idx, diag, max_age_frames=max_age_frames)
+        detections = _deduplicate_frame_detections(detections)
+        _match_tracks(
+            detections,
+            tracks,
+            frame_idx,
+            frame.shape[1],
+            frame.shape[0],
+            max_age_frames=max_age_frames,
+        )
+
+        if video_writer is not None:
+            video_writer.write(
+                _draw_active_tracks(frame, tracks, frame_idx, max_age_frames)
+            )
 
         frame_idx += 1
         if progress_cb and total_frames > 0 and analyzed % 3 == 0:
@@ -336,60 +591,17 @@ def analyze_video(
 
     cap.release()
     if video_writer is not None:
-        video_writer.release()
-
+        if progress_cb:
+            progress_cb(89, 'Finalizing browser-compatible video…')
         try:
-            ffmpeg_executable = _ffmpeg_executable()
-            if not ffmpeg_executable:
-                raise RuntimeError('FFmpeg is unavailable.')
-
-            subprocess.run(
-                [
-                    ffmpeg_executable,
-                    "-y",
-                    "-i",
-                    str(raw_annotated_path),
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "veryfast",
-                    "-crf",
-                    "23",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-tag:v",
-                    "avc1",
-                    "-movflags",
-                    "+faststart",
-                    "-an",
-                    str(final_annotated_path),
-                ],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-
-            raw_annotated_path.unlink(missing_ok=True)
-
-            annotated_video_url = (
-                f"/evidence/{job_id}/annotated.mp4"
-            )
-
+            video_writer.release()
+            if final_annotated_path.exists() and final_annotated_path.stat().st_size > 0:
+                annotated_video_url = f'/evidence/{job_id}/annotated.mp4'
+            else:
+                warnings.append('The analyzed video encoder produced an empty file.')
         except Exception:
-
-            try:
-                raw_annotated_path.replace(
-                    final_annotated_path
-                )
-
-                annotated_video_url = (
-                    f"/evidence/{job_id}/annotated.mp4"
-                )
-
-            except Exception:
-                warnings.append(
-                    "The analyzed video could not be finalized."
-                )
+            final_annotated_path.unlink(missing_ok=True)
+            warnings.append('The analyzed video could not be finalized.')
 
     defects = []
     counts = {

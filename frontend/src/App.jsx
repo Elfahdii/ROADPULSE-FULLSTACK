@@ -6,7 +6,6 @@ import {
   AlertTriangle,
   BarChart3,
   Camera,
-  CheckCircle2,
   Clock,
   CloudUpload,
   Download,
@@ -70,14 +69,6 @@ function formatDuration(seconds) {
   const mins = Math.floor(total / 60)
   const secs = total % 60
   return `${mins} min ${String(secs).padStart(2, '0')} sec`
-}
-
-function formatTime(seconds) {
-  if (seconds == null || Number.isNaN(Number(seconds))) return '—'
-  const total = Math.max(0, Math.floor(Number(seconds)))
-  const mins = Math.floor(total / 60)
-  const secs = total % 60
-  return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`
 }
 
 function StatusPill({ value }) {
@@ -151,7 +142,6 @@ function RoadMap({ result }) {
             <Popup>
               <strong>{CLASS_LABELS[d.class_name] || d.class_name}</strong><br />
               Confidence: {(d.confidence * 100).toFixed(1)}%<br />
-              Time: {formatTime(d.t_sec)}<br />
               {d.road_name || ''}
             </Popup>
           </CircleMarker>
@@ -217,7 +207,7 @@ function PersistentRoadMap({ surveys }) {
                 >
                   <Popup>
                     <strong>{CLASS_LABELS[defect.class_name] || defect.class_name}</strong><br />
-                    {result.location?.road_name || 'Road location'} · {formatTime(defect.t_sec)}
+                    {result.location?.road_name || 'Road location'}
                   </Popup>
                 </CircleMarker>
               ))}
@@ -249,11 +239,10 @@ function downloadReport(result) {
     ['Analysis Sampling (fps)', result.video?.analysis_sampling_fps ?? ''],
     ['Frame Stride', result.video?.analysis_frame_stride ?? ''],
     [],
-    ['Type', 'Confidence', 'Video Time (sec)', 'Road', 'Latitude', 'Longitude'],
+    ['Type', 'Confidence', 'Road', 'Latitude', 'Longitude'],
     ...(result.defects || []).map(d => [
       CLASS_LABELS[d.class_name] || d.class_name,
       d.confidence,
-      d.t_sec,
       d.road_name || '',
       d.latitude ?? '',
       d.longitude ?? '',
@@ -273,15 +262,31 @@ function UploadSurvey({ onStarted }) {
   const [video, setVideo] = useState(null)
   const [gpsFile, setGpsFile] = useState(null)
   const [error, setError] = useState('')
+  const [uploading, setUploading] = useState(false)
+  const [uploadProgress, setUploadProgress] = useState(0)
+  const uploadLockRef = useRef(false)
 
   async function submit() {
     if (!video) return setError('Choose a road video first.')
+    if (uploadLockRef.current) return
+    uploadLockRef.current = true
+    setUploading(true)
+    setUploadProgress(0)
     setError('')
     try {
-      const job = await createAnalysisJob({ videoFile: video, gpsFile })
+      const job = await createAnalysisJob({
+        videoFile: video,
+        gpsFile,
+        onUploadProgress: progress => {
+          if (progress != null) setUploadProgress(progress)
+        },
+      })
       onStarted(job.job_id)
     } catch (e) {
       setError(e?.response?.data?.detail || e.message || 'Could not start analysis.')
+    } finally {
+      uploadLockRef.current = false
+      setUploading(false)
     }
   }
 
@@ -297,7 +302,7 @@ function UploadSurvey({ onStarted }) {
         <FileVideo size={34} />
         <strong>{video ? video.name : 'Choose road video'}</strong>
         <span>MP4, MOV, WEBM, AVI or MKV</span>
-        <input type="file" accept="video/*" onChange={e => setVideo(e.target.files?.[0] || null)} hidden />
+        <input type="file" accept="video/*" disabled={uploading} onChange={e => setVideo(e.target.files?.[0] || null)} hidden />
       </label>
       <div className="auto-analysis-strip">
         <div><MapPin size={18} /><span><strong>Automatic location</strong><small>Uses embedded video GPS when available</small></span></div>
@@ -309,12 +314,24 @@ function UploadSurvey({ onStarted }) {
         <p>If the video was exported through WhatsApp, social media or an editor, its GPS metadata may have been removed. You can attach a synchronized RoadPulse GPS JSON track instead. Road/street name is still resolved automatically.</p>
         <label className="gps-file-row">
           <MapPin size={16} />
-          <span><strong>{gpsFile ? gpsFile.name : 'Choose GPS JSON track'}</strong><small>Optional · timestamped latitude/longitude points</small></span>
-          <input type="file" accept="application/json,.json" onChange={e => setGpsFile(e.target.files?.[0] || null)} hidden />
+          <span><strong>{gpsFile ? gpsFile.name : 'Choose GPS JSON track'}</strong><small>Optional · synchronized latitude/longitude points</small></span>
+          <input type="file" accept="application/json,.json" disabled={uploading} onChange={e => setGpsFile(e.target.files?.[0] || null)} hidden />
         </label>
       </details>
       {error && <div className="error-box">{error}</div>}
-      <button className="primary-button" onClick={submit}><Play size={18} /> Analyze road video</button>
+      {uploading && (
+        <div className="upload-status" role="status" aria-live="polite">
+          <div className="progress-head">
+            <span>{uploadProgress >= 100 ? 'Starting analysis…' : 'Uploading video…'}</span>
+            <strong>{uploadProgress}%</strong>
+          </div>
+          <div className="progress-track"><div className="progress-fill" style={{ width: `${uploadProgress}%` }} /></div>
+          <small>Keep this page open. Analysis begins automatically after the upload.</small>
+        </div>
+      )}
+      <button className="primary-button" disabled={uploading} aria-busy={uploading} onClick={submit}>
+        {uploading ? <><Upload size={18} /> {uploadProgress >= 100 ? 'Starting analysis…' : `Uploading ${uploadProgress}%`}</> : <><Play size={18} /> Analyze road video</>}
+      </button>
       <p className="micro-note">If an exported video no longer contains GPS metadata, RoadPulse will say location unavailable rather than guessing. Use “Record with Phone” for synchronized GPS and motion capture.</p>
     </section>
   )
@@ -480,28 +497,6 @@ function RecordSurvey({ onStarted }) {
   )
 }
 
-function EmptyDashboard({ onUpload, onRecord }) {
-  return (
-    <div className="dashboard-grid empty-dashboard">
-      <div className="metrics-grid">
-        <MetricCard icon={Gauge} label="Road Health Score" value="— / 100" helper="Analyze a road video to calculate" tone="green" />
-        <MetricCard icon={AlertTriangle} label="Unique Defects" value="—" helper="No road video analyzed yet" tone="yellow" />
-        <MetricCard icon={Activity} label="Roughness Index" value="— / 100" helper="Measured automatically" tone="red" />
-        <MetricCard icon={MapPin} label="Road" value="Not identified" helper="Resolved from GPS" tone="blue" />
-      </div>
-      <section className="panel start-card">
-        <div className="start-icon"><Route size={34} /></div>
-        <h2>Start a RoadPulse video analysis</h2>
-        <p>Upload a road video or record directly from your phone. RoadPulse will detect damage, locate the road and estimate roughness automatically.</p>
-        <div className="start-actions">
-          <button className="primary-button compact" onClick={onUpload}><Upload size={18} /> Upload video</button>
-          <button className="ghost-button compact" onClick={onRecord}><Camera size={18} /> Record with phone</button>
-        </div>
-      </section>
-    </div>
-  )
-}
-
 function AnalysisProgress({ job, jobId, onReset }) {
   const progress = job?.progress ?? 0
   return (
@@ -650,15 +645,14 @@ function AnalysisResults({ result }) {
           </div>
           <div className="table-wrap">
             <table>
-              <thead><tr><th>#</th><th>Type</th><th>Confidence</th><th>Timestamp</th><th>Road</th></tr></thead>
+              <thead><tr><th>#</th><th>Type</th><th>Confidence</th><th>Road</th></tr></thead>
               <tbody>
-                {sortedDefects.length === 0 && <tr><td colSpan="5" className="empty-cell">No defects detected.</td></tr>}
+                {sortedDefects.length === 0 && <tr><td colSpan="4" className="empty-cell">No defects detected.</td></tr>}
                 {sortedDefects.slice(0, 10).map((d, i) => (
                   <tr key={d.id}>
                     <td>{i + 1}</td>
                     <td>{CLASS_LABELS[d.class_name] || d.class_name}</td>
                     <td>{(d.confidence * 100).toFixed(1)}%</td>
-                    <td>{formatTime(d.t_sec)}</td>
                     <td>{d.road_name || location.road_name || '—'}</td>
                   </tr>
                 ))}
@@ -681,7 +675,6 @@ function AnalysisResults({ result }) {
                     <span style={{ background: CLASS_COLORS[d.class_name] || '#ff5d73' }}>{CLASS_LABELS[d.class_name] || d.class_name}</span>
                     <strong>{d.confidence.toFixed(2)}</strong>
                   </div>
-                  <div className="evidence-time">{formatTime(d.t_sec)}</div>
                 </div>
               ))}
             </div>
@@ -694,7 +687,6 @@ function AnalysisResults({ result }) {
         <div><Route size={18} /><span><small>Coordinates</small><strong>{location.center_lat != null ? `${location.center_lat.toFixed(6)}, ${location.center_lon.toFixed(6)}` : 'Unavailable'}</strong></span></div>
         <div><Clock size={18} /><span><small>Video Duration</small><strong>{formatDuration(result.video?.duration_sec)}</strong></span></div>
         <div><FileVideo size={18} /><span><small>Video File</small><strong>{result.video?.filename || 'Unknown'}</strong></span></div>
-        <div><CheckCircle2 size={18} /><span><small>Processed At</small><strong>{result.video?.processed_at ? new Date(result.video.processed_at).toLocaleString() : 'Just now'}</strong></span></div>
       </section>
     </div>
   )
@@ -702,9 +694,9 @@ function AnalysisResults({ result }) {
 
 
 function formatSurveyDate(value) {
-  if (!value) return 'Unknown time'
+  if (!value) return 'Unknown date'
   const d = new Date(value)
-  return Number.isNaN(d.getTime()) ? value : d.toLocaleString()
+  return Number.isNaN(d.getTime()) ? value : d.toLocaleDateString()
 }
 
 function conditionFromScore(score) {
@@ -827,7 +819,7 @@ function AnalysisHistoryPage({ surveys, selectedAnalysisId, onOpenAnalysis, onNe
   )
 }
 
-function HistoryReportsPage({ surveys, result, selectedAnalysisId, onOpenAnalysis, onNewAnalysis, onOpenDashboard }) {
+function HistoryReportsPage({ surveys, result, selectedAnalysisId, onOpenAnalysis, onNewAnalysis }) {
   return (
     <div className="history-report-stack">
       <section className="panel report-page combined-report-page">
@@ -848,7 +840,6 @@ function HistoryReportsPage({ surveys, result, selectedAnalysisId, onOpenAnalysi
             </div>
             <div className="report-actions">
               <button className="primary-button compact" onClick={() => downloadReport(result)}><Download size={17} /> Download CSV report</button>
-              <button className="ghost-button compact" onClick={onOpenDashboard}><LayoutDashboard size={17} /> Open on Dashboard</button>
             </div>
           </>
         ) : (
@@ -861,6 +852,12 @@ function HistoryReportsPage({ surveys, result, selectedAnalysisId, onOpenAnalysi
         onOpenAnalysis={onOpenAnalysis}
         onNewAnalysis={onNewAnalysis}
       />
+      {result && (
+        <div className="unified-dashboard">
+          <AnalysisResults result={result} />
+          <DefectsPage result={result} />
+        </div>
+      )}
     </div>
   )
 }
@@ -890,7 +887,6 @@ function DefectsPage({ result }) {
       CLASS_LABELS[d.class_name] || d.class_name,
       d.road_name,
       location.road_name,
-      formatTime(d.t_sec),
     ].filter(Boolean).join(' ').toLowerCase().includes(normalizedQuery)
   })
 
@@ -923,7 +919,7 @@ function DefectsPage({ result }) {
 
       <section className="panel defects-workspace">
         <div className="defects-toolbar">
-          <div className="search-box"><Search size={16} /><input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search defect type, road or timestamp" /></div>
+          <div className="search-box"><Search size={16} /><input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search defect type or road" /></div>
           <div className="filter-chips">
             <button className={filter === 'all' ? 'active' : ''} onClick={() => setFilter('all')}>All ({defects.length})</button>
             {Object.entries(CLASS_LABELS).map(([key, label]) => (
@@ -935,15 +931,14 @@ function DefectsPage({ result }) {
         <div className="defects-dedicated-grid">
           <div className="defects-full-table">
             <table>
-              <thead><tr><th>#</th><th>Type</th><th>Confidence</th><th>Time</th><th>Road</th><th>GPS</th></tr></thead>
+              <thead><tr><th>#</th><th>Type</th><th>Confidence</th><th>Road</th><th>GPS</th></tr></thead>
               <tbody>
-                {filtered.length === 0 && <tr><td colSpan="6" className="empty-cell">No defects match this filter.</td></tr>}
+                {filtered.length === 0 && <tr><td colSpan="5" className="empty-cell">No defects match this filter.</td></tr>}
                 {filtered.map((d, i) => (
                   <tr key={d.id}>
                     <td>{i + 1}</td>
                     <td><span className="defect-label"><i style={{ background: CLASS_COLORS[d.class_name] }} />{CLASS_LABELS[d.class_name] || d.class_name}</span></td>
                     <td>{(d.confidence * 100).toFixed(1)}%</td>
-                    <td>{formatTime(d.t_sec)}</td>
                     <td>{d.road_name || location.road_name || '—'}</td>
                     <td>{d.latitude != null ? `${d.latitude.toFixed(5)}, ${d.longitude.toFixed(5)}` : '—'}</td>
                   </tr>
@@ -960,7 +955,7 @@ function DefectsPage({ result }) {
                   <img src={`${API_URL}${d.evidence_url}`} alt={d.class_name} />
                   <span>
                     <strong>{CLASS_LABELS[d.class_name] || d.class_name}</strong>
-                    <small>{(d.confidence * 100).toFixed(1)}% · {formatTime(d.t_sec)}</small>
+                    <small>{(d.confidence * 100).toFixed(1)}% confidence</small>
                   </span>
                 </div>
               ))}
@@ -973,13 +968,9 @@ function DefectsPage({ result }) {
   )
 }
 
-function UnifiedDashboard({ result, surveys, mapResults, onUpload, onRecord, onOpenAnalysis }) {
+function UnifiedDashboard({ surveys, mapResults, onOpenAnalysis }) {
   return (
     <div className="unified-dashboard">
-      {result
-        ? <AnalysisResults result={result} />
-        : <EmptyDashboard onUpload={onUpload} onRecord={onRecord} />}
-
       <RoadRankings surveys={surveys} onOpenAnalysis={onOpenAnalysis} />
 
       <section className="panel network-map-panel">
@@ -992,7 +983,24 @@ function UnifiedDashboard({ result, surveys, mapResults, onUpload, onRecord, onO
         </div>
         <PersistentRoadMap surveys={mapResults} />
       </section>
+    </div>
+  )
+}
 
+function VideoAnalysisPage({ result, mode, onNewAnalysis }) {
+  const uploaded = mode === 'upload'
+  return (
+    <div className="unified-dashboard">
+      <section className="panel analysis-header">
+        <div>
+          <div className="panel-title">{uploaded ? 'Uploaded Video Analysis' : 'Recorded Video Analysis'}</div>
+          <p className="muted">The latest result stays with the video workflow where it was created.</p>
+        </div>
+        <button className="primary-button compact" onClick={onNewAnalysis}>
+          <RotateCcw size={16} /> {uploaded ? 'Upload another video' : 'Record another video'}
+        </button>
+      </section>
+      <AnalysisResults result={result} />
       <DefectsPage result={result} />
     </div>
   )
@@ -1058,6 +1066,7 @@ function App() {
   const [selectedResult, setSelectedResult] = useState(null)
   const [selectedSurveyId, setSelectedSurveyId] = useState(null)
   const [historyError, setHistoryError] = useState('')
+  const [analysisOrigin, setAnalysisOrigin] = useState(null)
 
 
   async function refreshMapResults(rows = null) {
@@ -1086,17 +1095,12 @@ function App() {
 
 
 
-  async function refreshSurveys({ openLatest = false } = {}) {
+  async function refreshSurveys() {
     try {
       const rows = await listSurveys()
       setSurveys(rows)
       await refreshMapResults(rows)
       setHistoryError('')
-      if (openLatest && rows.length > 0 && !jobId && !selectedResult) {
-        const detail = await getSurvey(rows[0].survey_id)
-        setSelectedResult(detail.result)
-        setSelectedSurveyId(rows[0].survey_id)
-      }
     } catch (e) {
       setHistoryError(e.message || 'Could not load analysis history.')
     }
@@ -1104,8 +1108,7 @@ function App() {
 
   useEffect(() => {
     getHealth().then(setBackendHealth).catch(() => setBackendHealth({ ok: false, model_loaded: false }))
-    // Restore the most recent completed analysis after a browser refresh.
-    refreshSurveys({ openLatest: true })
+    refreshSurveys()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -1120,7 +1123,6 @@ function App() {
           if (data.status === 'completed') {
             setSelectedResult(null)
             setSelectedSurveyId(data.job_id)
-            setActivePage('dashboard')
             refreshSurveys().catch(() => {})
           }
           if (!['completed', 'failed'].includes(data.status)) setTimeout(tick, 1000)
@@ -1139,6 +1141,7 @@ function App() {
     setSelectedResult(null)
     setSelectedSurveyId(null)
     setPollError('')
+    setAnalysisOrigin(page)
     setActivePage(page)
   }
 
@@ -1146,16 +1149,17 @@ function App() {
     newSurvey('upload')
   }
 
-  function startJob(id) {
+  function startJob(id, page) {
     setSelectedResult(null)
     setSelectedSurveyId(null)
     setJobId(id)
     setJob(null)
     setPollError('')
-    setActivePage('dashboard')
+    setAnalysisOrigin(page)
+    setActivePage(page)
   }
 
-  async function openSurvey(id, page = 'dashboard') {
+  async function openSurvey(id, page = 'history') {
     try {
       const detail = await getSurvey(id)
       setJobId(null)
@@ -1163,6 +1167,7 @@ function App() {
       setSelectedSurveyId(id)
       setSelectedResult(detail.result)
       setPollError('')
+      setAnalysisOrigin('history')
       setActivePage(page)
     } catch (e) {
       setHistoryError(e.message || 'Could not open the saved analysis.')
@@ -1173,8 +1178,8 @@ function App() {
   const analyzing = jobId && job?.status !== 'completed' && job?.status !== 'failed'
 
   function renderMain() {
-    if (analyzing) return <AnalysisProgress job={job} jobId={jobId} onReset={reset} />
-    if (job?.status === 'failed') {
+    if (analyzing && activePage === analysisOrigin) return <AnalysisProgress job={job} jobId={jobId} onReset={reset} />
+    if (job?.status === 'failed' && activePage === analysisOrigin) {
       return (
         <section className="panel failed-panel">
           <XCircle size={36} />
@@ -1185,31 +1190,35 @@ function App() {
       )
     }
 
-    if (activePage === 'upload') return <UploadSurvey onStarted={startJob} />
-    if (activePage === 'record') return <RecordSurvey onStarted={startJob} />
+    if (activePage === 'upload') {
+      return result && analysisOrigin === 'upload'
+        ? <VideoAnalysisPage result={result} mode="upload" onNewAnalysis={() => newSurvey('upload')} />
+        : <UploadSurvey onStarted={(id) => startJob(id, 'upload')} />
+    }
+    if (activePage === 'record') {
+      return result && analysisOrigin === 'record'
+        ? <VideoAnalysisPage result={result} mode="record" onNewAnalysis={() => newSurvey('record')} />
+        : <RecordSurvey onStarted={(id) => startJob(id, 'record')} />
+    }
     if (activePage === 'about') return <AboutPage />
 
     if (activePage === 'history') {
       return (
         <HistoryReportsPage
           surveys={surveys}
-          result={result}
+          result={analysisOrigin === 'history' ? result : null}
           selectedAnalysisId={selectedSurveyId}
           onOpenAnalysis={(id) => openSurvey(id, 'history')}
           onNewAnalysis={() => newSurvey('upload')}
-          onOpenDashboard={() => setActivePage('dashboard')}
         />
       )
     }
 
     return (
       <UnifiedDashboard
-        result={result}
         surveys={surveys}
         mapResults={mapResults}
-        onUpload={() => newSurvey('upload')}
-        onRecord={() => newSurvey('record')}
-        onOpenAnalysis={openSurvey}
+        onOpenAnalysis={(id) => openSurvey(id, 'history')}
       />
     )
   }
@@ -1235,7 +1244,7 @@ function App() {
           </div>
           <div className="top-actions">
             <div className="live-chip"><span /> {backendHealth?.ok ? 'System online' : 'Checking system'}</div>
-            {result && activePage !== 'upload' && activePage !== 'record' && (
+            {result && activePage === 'history' && analysisOrigin === 'history' && (
               <button className="ghost-button compact" onClick={() => newSurvey('upload')}><RotateCcw size={15} /> New Video Analysis</button>
             )}
           </div>

@@ -12,3 +12,4 @@ data/evidence/*
 
 data/roadpulse.db
 .idea/
+.codespaces/

@@ -60,11 +60,14 @@ button { cursor: pointer; }
 .micro-note { color: #7f91a7; font-size: 11px; line-height: 1.5; margin: 12px 0 0; }
 .primary-button, .danger-button, .ghost-button { border-radius: 9px; padding: 11px 14px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; font-weight: 800; border: 1px solid transparent; }
 .primary-button { background: linear-gradient(135deg, #7b4ce2, #5c37c7); color: white; box-shadow: 0 8px 22px rgba(123,76,226,.24); }
+.primary-button:disabled { cursor: wait; opacity: .72; box-shadow: none; }
 .ghost-button { background: #0b1726; color: #c1cee0; border-color: #31425a; }
 .danger-button { background: #e84155; color: #fff; }
 .compact { width: auto; padding: 9px 14px; }
 .upload-panel { max-width: 920px; margin: 12px auto 0; padding: 22px; }
 .upload-panel .panel-title, .phone-panel .panel-title { font-size: 18px; }
+.upload-status { margin: 0 0 14px; padding: 12px; border: 1px solid #31425a; border-radius: 10px; background: #0a1625; color: #c6d2df; }
+.upload-status small { display: block; margin-top: 8px; color: var(--muted); }
 .file-drop { margin: 18px 0; min-height: 210px; border: 1px dashed #3a4f6d; border-radius: 14px; background: #091523; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 9px; color: #c6d2df; transition: .2s; }
 .file-drop:hover { border-color: #7b4ce2; background: #0c1929; }
 .file-drop span { font-size: 11px; color: var(--muted); }

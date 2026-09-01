@@ -1,0 +1,28 @@
+{
+  "name": "RoadPulse",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "22"
+    }
+  },
+  "hostRequirements": {
+    "cpus": 2,
+    "memory": "8gb",
+    "storage": "32gb"
+  },
+  "forwardPorts": [5173],
+  "portsAttributes": {
+    "5173": {
+      "label": "RoadPulse",
+      "onAutoForward": "openBrowser",
+      "protocol": "http"
+    }
+  },
+  "postCreateCommand": "python -m pip install --no-cache-dir -r backend/requirements.txt && npm --prefix frontend ci",
+  "postStartCommand": "bash .devcontainer/start-roadpulse.sh",
+  "remoteUser": "vscode"
+}
