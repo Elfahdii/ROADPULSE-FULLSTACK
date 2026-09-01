@@ -2,6 +2,8 @@
 
 React/Vite + FastAPI RoadPulse MVP for road-damage detection, automatic GPS road identification, roughness estimation and Road Health scoring.
 
+My project is called RoadPulse. The problem I wanted to address is that inspecting roads manually takes time, and defects can be missed or recorded inconsistently. RoadPulse allows a user to upload or record a road video. The system analyzes one frame per second, detects cracks and potholes, identifies the road location when GPS data is available, and gives the road a health score. The results are presented on a dashboard with road rankings, a map, defect evidence, history, and downloadable reports.
+
 ## What is implemented
 
 - Professional dark React dashboard with sidebar navigation inspired by a municipal operations console.
